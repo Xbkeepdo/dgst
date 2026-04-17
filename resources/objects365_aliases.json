@@ -1,0 +1,325 @@
+{
+  "dataset": "objects365",
+  "dataset_version": "v2",
+  "taxonomy_space": "objects365_v2",
+  "lexicon_version": "objects365_aliases_v1",
+  "alias_groups": [
+    {
+      "canonical": "barrel/bucket",
+      "aliases": [
+        "barrel",
+        "barrels",
+        "bucket",
+        "buckets"
+      ]
+    },
+    {
+      "canonical": "baseball bat",
+      "aliases": [
+        "baseball bat",
+        "baseball bats",
+        "bat",
+        "bats"
+      ]
+    },
+    {
+      "canonical": "baseball glove",
+      "aliases": [
+        "baseball glove",
+        "baseball gloves",
+        "glove",
+        "gloves"
+      ]
+    },
+    {
+      "canonical": "blackboard/whiteboard",
+      "aliases": [
+        "blackboard",
+        "blackboards",
+        "whiteboard",
+        "whiteboards",
+        "board",
+        "boards"
+      ]
+    },
+    {
+      "canonical": "bowl/basin",
+      "aliases": [
+        "bowl",
+        "bowls",
+        "basin",
+        "basins"
+      ]
+    },
+    {
+      "canonical": "cabinet/shelf",
+      "aliases": [
+        "cabinet",
+        "cabinets",
+        "shelf",
+        "shelves"
+      ]
+    },
+    {
+      "canonical": "cell phone",
+      "aliases": [
+        "cellphone",
+        "phone",
+        "phones",
+        "mobile phone",
+        "mobile phones",
+        "smartphone",
+        "smartphones"
+      ]
+    },
+    {
+      "canonical": "coffee table",
+      "aliases": [
+        "coffee table",
+        "coffee tables"
+      ]
+    },
+    {
+      "canonical": "cosmetics brush/eyeliner pencil",
+      "aliases": [
+        "cosmetics brush",
+        "makeup brush",
+        "eyeliner pencil",
+        "brush"
+      ]
+    },
+    {
+      "canonical": "dining table",
+      "aliases": [
+        "table",
+        "tables",
+        "dining table",
+        "dining tables"
+      ]
+    },
+    {
+      "canonical": "fire hydrant",
+      "aliases": [
+        "fire hydrant",
+        "fire hydrants",
+        "hydrant",
+        "hydrants"
+      ]
+    },
+    {
+      "canonical": "hair dryer",
+      "aliases": [
+        "hair drier",
+        "hair dryer",
+        "dryer"
+      ]
+    },
+    {
+      "canonical": "handbag/satchel",
+      "aliases": [
+        "handbag",
+        "handbags",
+        "satchel",
+        "satchels",
+        "purse",
+        "purses"
+      ]
+    },
+    {
+      "canonical": "head phone",
+      "aliases": [
+        "headphone",
+        "headphones",
+        "earphone",
+        "earphones"
+      ]
+    },
+    {
+      "canonical": "monitor/tv",
+      "aliases": [
+        "tv",
+        "television",
+        "monitor"
+      ]
+    },
+    {
+      "canonical": "orange/tangerine",
+      "aliases": [
+        "orange",
+        "oranges",
+        "tangerine",
+        "tangerines"
+      ]
+    },
+    {
+      "canonical": "pen/pencil",
+      "aliases": [
+        "pen",
+        "pens",
+        "pencil",
+        "pencils"
+      ]
+    },
+    {
+      "canonical": "pickup truck",
+      "aliases": [
+        "pickup",
+        "pickups",
+        "pickup truck",
+        "pickup trucks"
+      ]
+    },
+    {
+      "canonical": "picture/frame",
+      "aliases": [
+        "picture frame",
+        "frame",
+        "frames",
+        "picture",
+        "pictures"
+      ]
+    },
+    {
+      "canonical": "potted plant",
+      "aliases": [
+        "plant",
+        "plants"
+      ]
+    },
+    {
+      "canonical": "router/modem",
+      "aliases": [
+        "router",
+        "routers",
+        "modem",
+        "modems"
+      ]
+    },
+    {
+      "canonical": "sports car",
+      "aliases": [
+        "sports car",
+        "sports cars"
+      ]
+    },
+    {
+      "canonical": "street lights",
+      "aliases": [
+        "street light",
+        "street lights"
+      ]
+    },
+    {
+      "canonical": "suv",
+      "aliases": [
+        "suv",
+        "suvs"
+      ]
+    },
+    {
+      "canonical": "tape measur/ ruler",
+      "aliases": [
+        "tape measure",
+        "ruler",
+        "rulers",
+        "measuring tape"
+      ]
+    },
+    {
+      "canonical": "tea pot",
+      "aliases": [
+        "teapot",
+        "tea pot",
+        "tea pots"
+      ]
+    },
+    {
+      "canonical": "teddy bear",
+      "aliases": [
+        "teddy",
+        "teddies",
+        "stuffed bear",
+        "stuffed toy"
+      ]
+    },
+    {
+      "canonical": "tennis racket",
+      "aliases": [
+        "tennis racket",
+        "tennis racquet",
+        "racket",
+        "racquet"
+      ]
+    },
+    {
+      "canonical": "toilet paper",
+      "aliases": [
+        "toilet tissue",
+        "tissue paper"
+      ]
+    },
+    {
+      "canonical": "toothbrush",
+      "aliases": [
+        "toothbrush",
+        "toothbrushes"
+      ]
+    },
+    {
+      "canonical": "traffic light",
+      "aliases": [
+        "traffic light",
+        "traffic lights",
+        "stoplight",
+        "stoplights"
+      ]
+    },
+    {
+      "canonical": "trash bin can",
+      "aliases": [
+        "trash bin",
+        "trash bins",
+        "trash can",
+        "trash cans",
+        "garbage can",
+        "garbage cans",
+        "bin",
+        "bins"
+      ]
+    },
+    {
+      "canonical": "wallet/purse",
+      "aliases": [
+        "wallet",
+        "wallets",
+        "purse",
+        "purses"
+      ]
+    },
+    {
+      "canonical": "washing machine/drying machine",
+      "aliases": [
+        "washing machine",
+        "dryer",
+        "dryers",
+        "drying machine"
+      ]
+    },
+    {
+      "canonical": "wild bird",
+      "aliases": [
+        "bird",
+        "birds"
+      ]
+    },
+    {
+      "canonical": "wine glass",
+      "aliases": [
+        "wineglass",
+        "wine glasses",
+        "glass",
+        "glasses"
+      ]
+    }
+  ]
+}
