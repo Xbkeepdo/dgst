@@ -228,7 +228,7 @@ def main() -> None:
     paths = project_paths()
 
     if args.command == "single":
-        from .tasks import run_dgst_single_analysis
+        from .pipelines.run import run_dgst_single_analysis
 
         run_dgst_single_analysis(
             image_path=args.image,
@@ -241,7 +241,7 @@ def main() -> None:
         return
 
     if args.command == "evaluate":
-        from .tasks import run_dgst_dataset_evaluation
+        from .pipelines.run import run_dgst_dataset_evaluation
 
         result_file, evaluation_file, plot_dir = _resolve_eval_output_paths(
             args=args,
@@ -271,7 +271,7 @@ def main() -> None:
         return
 
     if args.command == "export-probe":
-        from .tasks import export_dgst_probe_dataset
+        from .pipelines.probe_tasks import export_dgst_probe_dataset
 
         dataset_spec = _build_dataset_spec(args)
         default_run_name = default_export_run_name(dataset_spec.dataset, dataset_spec.protocol, args.num_data)
@@ -292,7 +292,7 @@ def main() -> None:
         return
 
     if args.command == "train-probe":
-        from .tasks import train_dgst_probe_run
+        from .pipelines.probe_tasks import train_dgst_probe_run
 
         dataset_file = Path(args.dataset_file) if args.dataset_file else paths.probe_data_dir / "probe_dataset.jsonl"
         output_dir = (
@@ -321,7 +321,7 @@ def main() -> None:
         return
 
     if args.command == "eval-probe":
-        from .tasks import evaluate_dgst_probe_run
+        from .pipelines.probe_tasks import evaluate_dgst_probe_run
 
         metrics = evaluate_dgst_probe_run(
             ProbeEvalConfig(
@@ -340,7 +340,7 @@ def main() -> None:
         return
 
     if args.command == "build-cache":
-        from .tasks import build_dataset_cache
+        from .pipelines.run import build_dataset_cache
 
         summary = build_dataset_cache(_build_dataset_spec(args))
         print(json.dumps(summary, ensure_ascii=False, indent=2))
