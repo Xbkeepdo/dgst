@@ -199,11 +199,27 @@ def load_sampled_image_ids(eval_config: DGSTEvalConfig) -> tuple[list[int], Any]
 def load_ground_truth_entries(adapter: Any, eval_config: DGSTEvalConfig) -> list[dict[str, Any]]:
     spec = eval_config.dataset_spec
     metadata = adapter.protocol_metadata(spec.protocol)
+
+    # Sharded workers should not read/write the shared ground-truth file.
+    # They already receive an explicit image-id list, so we can derive the
+    # per-shard entries directly from the adapter and avoid cross-process races.
+    if eval_config.image_ids_file is not None:
+        desired_image_ids = adapter.list_image_ids(
+            split=spec.split,
+            max_samples=eval_config.num_data,
+            image_ids_file=eval_config.image_ids_file,
+        )
+        return [adapter.ground_truth_entry(image_id, protocol=spec.protocol) for image_id in desired_image_ids]
+
     desired_image_ids: list[int] | None = None
     regenerate = not spec.ground_truth_file.exists()
     existing_entries: list[dict[str, Any]] = []
     if not regenerate:
-        existing_entries = read_json_or_jsonl(spec.ground_truth_file)
+        try:
+            existing_entries = read_json_or_jsonl(spec.ground_truth_file)
+        except Exception:
+            existing_entries = []
+            regenerate = True
         first_entry = existing_entries[0] if existing_entries else {}
         regenerate = any(
             (
@@ -227,14 +243,6 @@ def load_ground_truth_entries(adapter: Any, eval_config: DGSTEvalConfig) -> list
             protocol=spec.protocol,
         )
     entries = read_json_or_jsonl(spec.ground_truth_file)
-    if eval_config.image_ids_file is not None:
-        wanted = set(
-            adapter.list_image_ids(
-                split=spec.split,
-                image_ids_file=eval_config.image_ids_file,
-            )
-        )
-        entries = [entry for entry in entries if int(entry["image_id"]) in wanted]
     if eval_config.num_data is not None:
         entries = entries[: eval_config.num_data]
     return entries
