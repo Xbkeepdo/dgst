@@ -114,6 +114,7 @@ class DGSTExportConfig:
 class ProbeTrainConfig:
     dataset_file: Path
     output_dir: Path
+    feature_set: str = "risk"
     batch_size: int = 16
     num_epochs: int = 100
     learning_rate: float = 1e-3
@@ -257,6 +258,7 @@ def apply_paper_probe_defaults(config: ProbeTrainConfig) -> ProbeTrainConfig:
     return ProbeTrainConfig(
         dataset_file=config.dataset_file,
         output_dir=config.output_dir,
+        feature_set=config.feature_set,
         batch_size=32,
         num_epochs=100,
         learning_rate=5e-4,

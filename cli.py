@@ -19,6 +19,7 @@ from .config import (
     project_paths,
     resolve_dataset_spec,
 )
+from .probe import PROBE_FEATURE_SET_CHOICES
 
 
 def _default_eval_run_name(*, prefix: str, dataset: str, protocol: str, num_data: int, seed: int) -> str:
@@ -194,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_probe.add_argument("--dataset-file", default=None)
     train_probe.add_argument("--run-name", default=None)
     train_probe.add_argument("--output-dir", default=None)
+    train_probe.add_argument("--feature-set", choices=PROBE_FEATURE_SET_CHOICES, default="risk")
     train_probe.add_argument("--batch-size", type=int, default=16)
     train_probe.add_argument("--num-epochs", type=int, default=100)
     train_probe.add_argument("--learning-rate", type=float, default=1e-3)
@@ -304,6 +306,7 @@ def main() -> None:
             ProbeTrainConfig(
                 dataset_file=dataset_file,
                 output_dir=output_dir,
+                feature_set=args.feature_set,
                 batch_size=args.batch_size,
                 num_epochs=args.num_epochs,
                 learning_rate=args.learning_rate,

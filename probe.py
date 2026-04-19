@@ -16,6 +16,10 @@ from tqdm import tqdm
 
 from .reporting import build_dgst_object_record
 
+PROBE_FEATURE_SET_RISK = "risk"
+PROBE_FEATURE_SET_PROBE6 = "probe6"
+PROBE_FEATURE_SET_CHOICES = (PROBE_FEATURE_SET_RISK, PROBE_FEATURE_SET_PROBE6)
+
 
 @dataclass
 class DGSTProbeSample:
@@ -35,6 +39,9 @@ class DGSTProbeSample:
     token_aligned: bool
     layer_ids: List[int]
     object_layer_dgst_risk: List[float]
+    dgst_probe6_feature_names: List[str]
+    dgst_probe6_layer_stats: List[Dict[str, Any]]
+    object_layer_dgst_probe6: List[float]
     dgst_final_score: float
 
 
@@ -75,6 +82,9 @@ def read_dgst_probe_dataset(path: Path) -> List[DGSTProbeSample]:
                     token_aligned=bool(payload.get("token_aligned", True)),
                     layer_ids=[int(value) for value in payload["layer_ids"]],
                     object_layer_dgst_risk=[float(value) for value in payload["object_layer_dgst_risk"]],
+                    dgst_probe6_feature_names=[str(value) for value in payload.get("dgst_probe6_feature_names", [])],
+                    dgst_probe6_layer_stats=list(payload.get("dgst_probe6_layer_stats", [])),
+                    object_layer_dgst_probe6=[float(value) for value in payload.get("object_layer_dgst_probe6", [])],
                     dgst_final_score=float(payload["dgst_final_score"]),
                 )
             )
@@ -107,6 +117,9 @@ def build_dgst_probe_samples_from_row(row: Dict[str, Any]) -> List[DGSTProbeSamp
                 token_aligned=bool(item.get("token_aligned", True)),
                 layer_ids=list(record.layer_ids),
                 object_layer_dgst_risk=list(record.layer_values),
+                dgst_probe6_feature_names=[str(value) for value in item.get("dgst_probe6_feature_names", [])],
+                dgst_probe6_layer_stats=list(item.get("dgst_probe6_layer_stats", [])),
+                object_layer_dgst_probe6=[float(value) for value in item.get("object_layer_dgst_probe6", [])],
                 dgst_final_score=float(record.final_score),
             )
         )
@@ -124,6 +137,7 @@ def summarize_dgst_probe_samples(samples: Sequence[DGSTProbeSample]) -> Dict[str
     positives = sum(int(sample.hallucinated) for sample in samples)
     image_ids = {int(sample.image_id) for sample in samples}
     layer_widths = sorted({len(sample.object_layer_dgst_risk) for sample in samples})
+    probe6_widths = sorted({len(sample.object_layer_dgst_probe6) for sample in samples if sample.object_layer_dgst_probe6})
     token_aligned = sum(int(sample.token_aligned) for sample in samples)
     return {
         "count": len(samples),
@@ -131,8 +145,22 @@ def summarize_dgst_probe_samples(samples: Sequence[DGSTProbeSample]) -> Dict[str
         "negatives": len(samples) - positives,
         "images": len(image_ids),
         "layer_widths": layer_widths,
+        "probe6_widths": probe6_widths,
         "token_aligned": token_aligned,
     }
+
+
+def get_probe_feature_vector(sample: DGSTProbeSample, feature_set: str) -> List[float]:
+    if feature_set == PROBE_FEATURE_SET_RISK:
+        return list(sample.object_layer_dgst_risk)
+    if feature_set == PROBE_FEATURE_SET_PROBE6:
+        if not sample.object_layer_dgst_probe6:
+            raise ValueError(
+                "Probe sample does not contain object_layer_dgst_probe6. "
+                "Re-export the probe dataset after enabling the probe6 feature implementation."
+            )
+        return list(sample.object_layer_dgst_probe6)
+    raise ValueError(f"Unsupported probe feature set: {feature_set}")
 
 
 def split_dgst_probe_samples_by_image(
@@ -228,15 +256,20 @@ def split_dgst_probe_samples_with_fixed_image_ids(
 
 
 class DGSTProbeDataset(Dataset):
-    def __init__(self, samples: Sequence[DGSTProbeSample]):
+    def __init__(self, samples: Sequence[DGSTProbeSample], feature_set: str = PROBE_FEATURE_SET_RISK):
         if not samples:
             raise ValueError("DGSTProbeDataset requires at least one sample.")
-        width = len(samples[0].object_layer_dgst_risk)
+        first_vector = get_probe_feature_vector(samples[0], feature_set)
+        width = len(first_vector)
         for sample in samples:
-            if len(sample.object_layer_dgst_risk) != width:
-                raise ValueError("All DGST probe samples must share the same layer width.")
+            if len(get_probe_feature_vector(sample, feature_set)) != width:
+                raise ValueError("All DGST probe samples must share the same feature width.")
         self.samples = list(samples)
-        self.features = torch.tensor([sample.object_layer_dgst_risk for sample in samples], dtype=torch.float32)
+        self.feature_set = str(feature_set)
+        self.features = torch.tensor(
+            [get_probe_feature_vector(sample, feature_set) for sample in samples],
+            dtype=torch.float32,
+        )
         self.labels = torch.tensor([1 - sample.hallucinated for sample in samples], dtype=torch.float32)
 
     def __len__(self) -> int:
@@ -286,6 +319,7 @@ class DGSTProbe(nn.Module):
 @dataclass
 class DGSTProbeConfig:
     input_dim: int
+    feature_set: str = PROBE_FEATURE_SET_RISK
     batch_size: int = 16
     num_epochs: int = 100
     learning_rate: float = 1e-3
@@ -305,9 +339,10 @@ def create_data_loaders(
     train_samples: Sequence[DGSTProbeSample],
     val_samples: Sequence[DGSTProbeSample],
     batch_size: int,
+    feature_set: str = PROBE_FEATURE_SET_RISK,
 ) -> tuple[DataLoader, DataLoader]:
-    train_dataset = DGSTProbeDataset(train_samples)
-    val_dataset = DGSTProbeDataset(val_samples)
+    train_dataset = DGSTProbeDataset(train_samples, feature_set=feature_set)
+    val_dataset = DGSTProbeDataset(val_samples, feature_set=feature_set)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -400,7 +435,12 @@ def train_dgst_probe(
     set_torch_seed(config.seed)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_loader, val_loader = create_data_loaders(train_samples, val_samples, batch_size=config.batch_size)
+    train_loader, val_loader = create_data_loaders(
+        train_samples,
+        val_samples,
+        batch_size=config.batch_size,
+        feature_set=config.feature_set,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DGSTProbe(input_dim=config.input_dim).to(device)
     criterion = nn.BCEWithLogitsLoss()

@@ -22,6 +22,7 @@ from ..probe import (
     DGSTProbeSample,
     build_dgst_probe_samples,
     build_dgst_val_prediction_rows,
+    get_probe_feature_vector,
     read_dgst_probe_dataset,
     split_dgst_probe_samples_by_image,
     split_dgst_probe_samples_with_fixed_image_ids,
@@ -230,7 +231,8 @@ def _run_single_dgst_probe_training(
         run_seed,
     )
     probe_config = DGSTProbeConfig(
-        input_dim=len(samples[0].object_layer_dgst_risk),
+        input_dim=len(get_probe_feature_vector(samples[0], train_config.feature_set)),
+        feature_set=train_config.feature_set,
         batch_size=train_config.batch_size,
         num_epochs=train_config.num_epochs,
         learning_rate=train_config.learning_rate,
@@ -271,6 +273,8 @@ def _run_single_dgst_probe_training(
         "finished_at_utc": finished_at.isoformat(),
         "elapsed_seconds": float((finished_at - started_at).total_seconds()),
         "device": training_result["device"],
+        "feature_set": train_config.feature_set,
+        "feature_dim": int(probe_config.input_dim),
         "positive_class": "non_hallucination",
         "label_definition": {"1": "non_hallucination", "0": "hallucination"},
         "train_sample_summary": summarize_dgst_probe_samples(train_samples),
@@ -334,6 +338,7 @@ def train_dgst_probe_run(train_config: ProbeTrainConfig) -> dict[str, Any]:
             "finished_at_utc": finished_at.isoformat(),
             "elapsed_seconds": float((finished_at - started_at).total_seconds()),
             "positive_class": "non_hallucination",
+            "feature_set": train_config.feature_set,
             "num_runs": int(train_config.num_runs),
             "seeds": run_seeds,
             "mean_auroc": float(mean_auroc),
@@ -365,6 +370,7 @@ def train_dgst_probe_run(train_config: ProbeTrainConfig) -> dict[str, Any]:
             "finished_at_utc": finished_at.isoformat(),
             "elapsed_seconds": float((finished_at - started_at).total_seconds()),
             "positive_class": metrics.get("positive_class", "non_hallucination"),
+            "feature_set": train_config.feature_set,
             "auroc": float(metrics.get("auroc", metrics.get("mean_auroc"))),
             "aupr": float(metrics.get("aupr", metrics.get("mean_aupr"))),
             "metrics_file": str(train_config.output_dir / "metrics.json"),
@@ -437,6 +443,7 @@ def _build_dgst_probe_model(config_file: Path, model_file: Path, device):
     config_payload = read_json(config_file)
     config = DGSTProbeConfig(**config_payload)
     model = DGSTProbe(input_dim=config.input_dim).to(device)
+    model._dgst_feature_set = str(getattr(config, "feature_set", "risk"))
     state_dict = torch.load(model_file, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
@@ -448,7 +455,12 @@ def _predict_dgst_non_hallucination_probabilities(model, samples: Sequence[DGSTP
 
     if not samples:
         raise ValueError("No DGST probe samples found in evaluation input.")
-    features = torch.tensor([sample.object_layer_dgst_risk for sample in samples], dtype=torch.float32, device=device)
+    feature_set = getattr(model, "_dgst_feature_set", "risk")
+    features = torch.tensor(
+        [get_probe_feature_vector(sample, feature_set) for sample in samples],
+        dtype=torch.float32,
+        device=device,
+    )
     with torch.no_grad():
         logits = model(features).squeeze(1)
         probabilities = torch.sigmoid(logits).cpu().tolist()
@@ -458,6 +470,8 @@ def _predict_dgst_non_hallucination_probabilities(model, samples: Sequence[DGSTP
 def _build_dgst_probe_prediction_rows(
     samples: Sequence[DGSTProbeSample],
     non_hall_probs: Sequence[float],
+    *,
+    feature_set: str,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for sample, probability in zip(samples, non_hall_probs):
@@ -475,6 +489,7 @@ def _build_dgst_probe_prediction_rows(
                 "non_hallucination_probability": float(probability),
                 "hallucination_probability": float(1.0 - probability),
                 "dgst_final_score": float(sample.dgst_final_score),
+                "feature_set": feature_set,
             }
         )
     return rows
@@ -490,6 +505,7 @@ def _summarize_dgst_probe_eval_samples(samples: Sequence[DGSTProbeSample]) -> di
         "images": int(len(image_ids)),
         "token_aligned": int(token_aligned),
         "layer_widths": sorted({len(sample.object_layer_dgst_risk) for sample in samples}),
+        "probe6_widths": sorted({len(sample.object_layer_dgst_probe6) for sample in samples if sample.object_layer_dgst_probe6}),
     }
 
 
@@ -529,6 +545,7 @@ def evaluate_dgst_probe_run(eval_config: ProbeEvalConfig) -> dict[str, Any]:
     device = choose_device(eval_config.device)
     started_at = datetime.now(timezone.utc)
     model, config_payload = _build_dgst_probe_model(config_file, model_file, device)
+    feature_set = str(config_payload.get("feature_set", "risk"))
     non_hall_probs = _predict_dgst_non_hallucination_probabilities(model, samples, device)
     finished_at = datetime.now(timezone.utc)
 
@@ -537,7 +554,7 @@ def evaluate_dgst_probe_run(eval_config: ProbeEvalConfig) -> dict[str, Any]:
     hallucination_probs = [float(1.0 - value) for value in non_hall_probs]
     non_hall_metrics = compute_binary_metrics(non_hall_labels, non_hall_probs)
     hallucination_metrics = compute_binary_metrics(hall_labels, hallucination_probs)
-    predictions = _build_dgst_probe_prediction_rows(samples, non_hall_probs)
+    predictions = _build_dgst_probe_prediction_rows(samples, non_hall_probs, feature_set=feature_set)
     prediction_file = output_dir / "predictions.jsonl"
     metrics_file = output_dir / "metrics.json"
     write_jsonl(prediction_file, predictions)
@@ -548,6 +565,7 @@ def evaluate_dgst_probe_run(eval_config: ProbeEvalConfig) -> dict[str, Any]:
         "probe_model_file": str(model_file),
         "probe_config_file": str(config_file),
         "probe_config": config_payload,
+        "feature_set": feature_set,
         "evaluation_source": source_path,
         "input_format": eval_config.input_format,
         "started_at_utc": started_at.isoformat(),

@@ -23,6 +23,11 @@ from .targets import (
 class DGSTTokenLayerScore:
     layer: int
     risk: float
+    source_entropy: float
+    target_entropy: float
+    distance_mean: float
+    source_semantic_penalty_mean: float
+    target_semantic_penalty_mean: float
     source_support_size: int
     target_support_size: int
     union_size: int
@@ -53,12 +58,17 @@ def _semantic_cost_matrix(
     return distance * penalty
 
 
+def _distribution_entropy(distribution: torch.Tensor) -> float:
+    safe = distribution.clamp_min(1e-12)
+    return float((-(safe * torch.log(safe))).sum().item())
+
+
 def _wasserstein_1_exact(
     source: torch.Tensor,
     target: torch.Tensor,
     cost: torch.Tensor,
     solver: str,
-) -> float:
+) -> tuple[float, torch.Tensor]:
     solver_name = str(solver).strip().lower()
     if solver_name != "linprog":
         raise ValueError(f"Unsupported OT solver: {solver}")
@@ -131,7 +141,8 @@ def _wasserstein_1_exact(
         result = _solve(reduced_constraints, reduced_targets)
     if not result.success:
         raise RuntimeError(f"Exact OT solver failed: {result.message}")
-    return float(result.fun)
+    plan = torch.tensor(result.x, dtype=torch.float64).reshape(n, n)
+    return float(result.fun), plan
 
 
 def summarize_dgst_targets(
@@ -157,6 +168,41 @@ def summarize_dgst_targets(
             for layer, values in sorted(layer_to_values.items())
         ]
 
+        probe6_layer_to_values: Dict[int, Dict[str, List[float]]] = {}
+        for token_score in selected:
+            for layer_score in token_score["dgst_layer_scores"]:
+                layer = int(layer_score["layer"])
+                slot = probe6_layer_to_values.setdefault(
+                    layer,
+                    {
+                        "risk": [],
+                        "source_entropy": [],
+                        "target_entropy": [],
+                        "distance_mean": [],
+                        "source_semantic_penalty_mean": [],
+                        "target_semantic_penalty_mean": [],
+                    },
+                )
+                for key in slot:
+                    slot[key].append(float(layer_score[key]))
+
+        probe6_layer_summary = []
+        probe6_flat: List[float] = []
+        probe6_feature_names = [
+            "risk",
+            "source_entropy",
+            "target_entropy",
+            "distance_mean",
+            "source_semantic_penalty_mean",
+            "target_semantic_penalty_mean",
+        ]
+        for layer, values in sorted(probe6_layer_to_values.items()):
+            entry = {"layer": layer}
+            for key in probe6_feature_names:
+                entry[key] = mean_or_zero(values[key])
+                probe6_flat.append(float(entry[key]))
+            probe6_layer_summary.append(entry)
+
         results.append(
             {
                 "kind": target.kind,
@@ -176,6 +222,9 @@ def summarize_dgst_targets(
                 "layer_ids": [int(item["layer"]) for item in layer_summary],
                 "object_layer_dgst_risk": [float(item["risk"]) for item in layer_summary],
                 "dgst_layer_scores": layer_summary,
+                "dgst_probe6_feature_names": probe6_feature_names,
+                "dgst_probe6_layer_stats": probe6_layer_summary,
+                "object_layer_dgst_probe6": probe6_flat,
                 "dgst_baseline_mean": mean_or_zero(item["dgst_baseline_mean"] for item in selected),
                 "dgst_baseline_std": mean_or_zero(item["dgst_baseline_std"] for item in selected),
                 "dgst_final_score": mean_or_zero(item["dgst_final_score"] for item in selected),
@@ -358,14 +407,33 @@ class LlavaDGSTAnalyzer(LlavaVICRAnalyzer):
                 local_target = renormalize(target_dist.index_select(0, support))
                 local_states = visual_states.index_select(0, support)
                 local_semantic = semantic_probs.index_select(0, support)
+                normalized_states = F.normalize(local_states.float(), dim=-1)
+                cosine = torch.matmul(normalized_states, normalized_states.transpose(0, 1))
+                distance = (1.0 - cosine).clamp_min(0.0)
+                source_semantic_penalty = torch.relu(1.0 - local_semantic)
+                target_semantic_penalty = torch.relu(1.0 - local_semantic)
                 cost = _semantic_cost_matrix(local_states, local_semantic, gamma1=gamma1, gamma2=gamma2)
-                risk = _wasserstein_1_exact(local_source, local_target, cost, solver=ot_solver)
+                risk, transport_plan = _wasserstein_1_exact(local_source, local_target, cost, solver=ot_solver)
+                source_entropy = _distribution_entropy(local_source)
+                target_entropy = _distribution_entropy(local_target)
+                distance_mean = float((transport_plan.to(distance.device) * distance).sum().item())
+                source_penalty_mean = float(
+                    (transport_plan.to(source_semantic_penalty.device) * source_semantic_penalty.unsqueeze(1)).sum().item()
+                )
+                target_penalty_mean = float(
+                    (transport_plan.to(target_semantic_penalty.device) * target_semantic_penalty.unsqueeze(0)).sum().item()
+                )
 
                 layer_risks.append(float(risk))
                 layer_scores.append(
                     DGSTTokenLayerScore(
                         layer=layer_index,
                         risk=float(risk),
+                        source_entropy=float(source_entropy),
+                        target_entropy=float(target_entropy),
+                        distance_mean=float(distance_mean),
+                        source_semantic_penalty_mean=float(source_penalty_mean),
+                        target_semantic_penalty_mean=float(target_penalty_mean),
                         source_support_size=min(max(int(transport_top_k // 2), 1), int(source_dist.numel())),
                         target_support_size=min(max(int(transport_top_k // 2), 1), int(target_dist.numel())),
                         union_size=int(support.numel()),
