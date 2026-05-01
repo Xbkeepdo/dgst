@@ -179,7 +179,8 @@ class LlavaVICRAnalyzer:
                 self.processor.num_additional_image_tokens = max(image_seq_length - patch_tokens, 0)
 
     def build_prompt(self, question: str, answer: str | None = None) -> str:
-        prefix = f"USER: <image>\n{question.strip()} ASSISTANT:"
+        clean_question = " ".join(str(question).replace("<image>", " ").split())
+        prefix = f"USER: <image>\n{clean_question} ASSISTANT:"
         if answer is None:
             return prefix
         clean_answer = answer.strip()

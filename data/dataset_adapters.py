@@ -699,6 +699,1405 @@ class Objects365DatasetAdapter(RuleAliasDatasetAdapter):
         return self.image_id_to_filename.get(int(image_id), "")
 
 
+class AmberDatasetAdapter(RuleAliasDatasetAdapter):
+    dataset_name = "amber"
+    dataset_version = "1.0"
+    native_taxonomy_space = "amber_generative"
+    lexicon_version = "amber_relation_v1"
+
+    def __init__(
+        self,
+        dataset_root: str | Path,
+        annotation_path: str | Path,
+        split: str = "val",
+        relation_path: str | Path | None = None,
+        safe_words_path: str | Path | None = None,
+        query_path: str | Path | None = None,
+    ) -> None:
+        source = Path(annotation_path)
+        data_dir = source if source.is_dir() else source.parent
+        self.annotation_file = source / "annotations.json" if source.is_dir() else source
+        self.relation_path = Path(relation_path) if relation_path is not None else data_dir / "relation.json"
+        self.safe_words_path = Path(safe_words_path) if safe_words_path is not None else data_dir / "safe_words.txt"
+        self.query_path = Path(query_path) if query_path is not None else data_dir / "query" / "query_generative.json"
+        self.image_id_to_truth_objects: Dict[int, List[str]] = {}
+        self.image_id_to_hallu_objects: Dict[int, List[str]] = {}
+        super().__init__(dataset_root=dataset_root, annotation_path=annotation_path, split=split)
+
+    @classmethod
+    def from_cache(
+        cls,
+        dataset_root: str | Path,
+        annotation_path: str | Path,
+        split: str = "val",
+        cache_path: str | Path | None = None,
+        relation_path: str | Path | None = None,
+        safe_words_path: str | Path | None = None,
+        query_path: str | Path | None = None,
+    ) -> "AmberDatasetAdapter":
+        cache = Path(cache_path) if cache_path is not None else None
+        root = Path(dataset_root)
+        source = Path(annotation_path)
+        data_dir = source if source.is_dir() else source.parent
+        annotation_file = source / "annotations.json" if source.is_dir() else source
+        relation = Path(relation_path) if relation_path is not None else data_dir / "relation.json"
+        safe_words = Path(safe_words_path) if safe_words_path is not None else data_dir / "safe_words.txt"
+        query = Path(query_path) if query_path is not None else data_dir / "query" / "query_generative.json"
+
+        if cache is not None and cache.exists():
+            if cache.suffix == ".pkl":
+                adapter = _load_pickled_adapter(cache)
+                if adapter is None:
+                    adapter = cls(
+                        dataset_root=root,
+                        annotation_path=source,
+                        split=split,
+                        relation_path=relation,
+                        safe_words_path=safe_words,
+                        query_path=query,
+                    )
+                    adapter.save_cache(cache)
+                    return adapter
+            else:
+                payload = _read_json(cache)
+                adapter = cls.__new__(cls)
+                adapter.category_id_to_name = {int(k): str(v) for k, v in payload["category_id_to_name"].items()}
+                adapter.image_id_to_objects = {
+                    int(k): set(str(value) for value in values)
+                    for k, values in payload["image_id_to_objects"].items()
+                }
+                adapter.image_id_to_truth_objects = {
+                    int(k): [str(value) for value in values]
+                    for k, values in payload.get("image_id_to_truth_objects", {}).items()
+                }
+                adapter.image_id_to_hallu_objects = {
+                    int(k): [str(value) for value in values]
+                    for k, values in payload.get("image_id_to_hallu_objects", {}).items()
+                }
+                adapter.image_id_to_filename = {int(k): str(v) for k, v in payload["image_id_to_filename"].items()}
+                adapter.image_id_to_references = {
+                    int(k): [str(value) for value in values]
+                    for k, values in payload.get("image_id_to_references", {}).items()
+                }
+                adapter.split_image_ids = [int(value) for value in payload["split_image_ids"]]
+            adapter.dataset_root = root
+            adapter.annotation_path = source
+            adapter.annotation_source = annotation_file
+            adapter.annotation_file = annotation_file
+            adapter.relation_path = relation
+            adapter.safe_words_path = safe_words
+            adapter.query_path = query
+            adapter.split = str(split)
+            if not getattr(adapter, "image_id_to_truth_objects", None):
+                adapter.image_id_to_truth_objects = {
+                    image_id: sorted(values) for image_id, values in adapter.image_id_to_objects.items()
+                }
+            if not getattr(adapter, "image_id_to_hallu_objects", None):
+                adapter.image_id_to_hallu_objects = {}
+            adapter._ensure_runtime_state()
+            return adapter
+
+        adapter = cls(
+            dataset_root=root,
+            annotation_path=source,
+            split=split,
+            relation_path=relation,
+            safe_words_path=safe_words,
+            query_path=query,
+        )
+        if cache is not None:
+            adapter.save_cache(cache)
+        return adapter
+
+    def to_json(self) -> Dict[str, Any]:
+        payload = super().to_json()
+        payload["image_id_to_truth_objects"] = {
+            str(k): list(v) for k, v in self.image_id_to_truth_objects.items()
+        }
+        payload["image_id_to_hallu_objects"] = {
+            str(k): list(v) for k, v in self.image_id_to_hallu_objects.items()
+        }
+        return payload
+
+    def _ensure_runtime_state(self) -> None:
+        self.amber_relation = self._load_relation_map()
+        self.global_safe_words = self._load_global_safe_words()
+        self.amber_annotation_words = self._load_annotation_words()
+        super()._ensure_runtime_state()
+        self.amber_vocabulary = set(self.native_alias_to_canonical.keys()) | set(self.amber_annotation_words)
+
+    def _load_relation_map(self) -> Dict[str, List[str]]:
+        if not self.relation_path.exists():
+            return {}
+        payload = _read_json(self.relation_path)
+        return {
+            _normalize_alias_text(key): _dedupe_preserve_order(
+                [_normalize_alias_text(value) for value in values if _normalize_alias_text(value)]
+            )
+            for key, values in payload.items()
+            if _normalize_alias_text(key)
+        }
+
+    def _load_global_safe_words(self) -> set[str]:
+        if not self.safe_words_path.exists():
+            return set()
+        return {
+            _normalize_alias_text(line)
+            for line in self.safe_words_path.read_text(encoding="utf-8").splitlines()
+            if _normalize_alias_text(line)
+        }
+
+    def _load_annotation_payload(self) -> List[Dict[str, Any]]:
+        if not self.annotation_file.exists():
+            raise FileNotFoundError(f"AMBER annotation file not found: {self.annotation_file}")
+        payload = json.loads(self.annotation_file.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError(f"AMBER annotations must be a JSON list: {self.annotation_file}")
+        return payload
+
+    def _load_annotation_words(self) -> set[str]:
+        if not self.annotation_file.exists():
+            return set()
+        words: set[str] = set()
+        for item in self._load_annotation_payload():
+            if item.get("type") != "generative":
+                continue
+            for key in ("truth", "hallu"):
+                for value in item.get(key, []):
+                    normalized = _normalize_alias_text(str(value))
+                    if normalized:
+                        words.add(normalized)
+        return words
+
+    def _build_native_alias_groups(self) -> List[List[str]]:
+        groups: List[List[str]] = []
+        relation = getattr(self, "amber_relation", None) or self._load_relation_map()
+        for canonical, aliases in relation.items():
+            values = [canonical]
+            values.extend(aliases)
+            groups.append(_dedupe_preserve_order([value for value in values if value]))
+
+        grouped_words = {group[0] for group in groups if group}
+        annotation_words = getattr(self, "amber_annotation_words", None) or self._load_annotation_words()
+        for word in sorted(annotation_words):
+            if word not in grouped_words:
+                groups.append([word])
+        return groups
+
+    def _load_query_image_names(self) -> Dict[int, str]:
+        if not self.query_path.exists():
+            return {}
+        payload = json.loads(self.query_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            return {}
+        return {
+            int(item["id"]): str(item.get("image") or f"AMBER_{int(item['id'])}.jpg")
+            for item in payload
+            if "id" in item
+        }
+
+    def _load_annotations(self) -> None:
+        query_images = self._load_query_image_names()
+        annotation_words: set[str] = set()
+
+        for item in tqdm(self._load_annotation_payload(), desc="Loading AMBER generative annotations", unit="ann", leave=False):
+            if item.get("type") != "generative":
+                continue
+            image_id = int(item["id"])
+            truth_objects = _dedupe_preserve_order(
+                [_normalize_alias_text(str(value)) for value in item.get("truth", []) if _normalize_alias_text(str(value))]
+            )
+            hallu_objects = _dedupe_preserve_order(
+                [_normalize_alias_text(str(value)) for value in item.get("hallu", []) if _normalize_alias_text(str(value))]
+            )
+            self.image_id_to_truth_objects[image_id] = truth_objects
+            self.image_id_to_hallu_objects[image_id] = hallu_objects
+            self.image_id_to_objects[image_id] = set(truth_objects)
+            self.image_id_to_filename[image_id] = query_images.get(image_id, f"AMBER_{image_id}.jpg")
+            self.split_image_ids.append(image_id)
+            annotation_words.update(truth_objects)
+            annotation_words.update(hallu_objects)
+
+        self.split_image_ids = sorted(set(self.split_image_ids))
+        for category_id, name in enumerate(sorted(annotation_words), start=1):
+            self.category_id_to_name[category_id] = name
+
+    def _relation_aliases(self, word: str) -> List[str]:
+        normalized = _normalize_alias_text(word)
+        aliases = [normalized]
+        aliases.extend(self.amber_relation.get(normalized, []))
+        return _dedupe_preserve_order([value for value in aliases if value])
+
+    def _image_word_maps(self, image_id: int) -> tuple[Dict[str, str], Dict[str, str]]:
+        safe_alias_to_canonical: Dict[str, str] = {}
+        hallu_alias_to_canonical: Dict[str, str] = {}
+        for canonical in self.image_id_to_truth_objects.get(int(image_id), []):
+            for alias in self._relation_aliases(canonical):
+                safe_alias_to_canonical.setdefault(alias, canonical)
+        for canonical in self.image_id_to_hallu_objects.get(int(image_id), []):
+            for alias in self._relation_aliases(canonical):
+                hallu_alias_to_canonical.setdefault(alias, canonical)
+        return safe_alias_to_canonical, hallu_alias_to_canonical
+
+    def _extract_candidate_nouns(self, text: str) -> List[tuple[int, str]]:
+        if nltk is not None:
+            for path in NLTK_DATA_CANDIDATES:
+                if path.exists():
+                    path_str = str(path)
+                    if path_str not in nltk.data.path:
+                        nltk.data.path.insert(0, path_str)
+            try:
+                raw_tokens = nltk.word_tokenize(str(text).lower())
+                tagged = nltk.pos_tag(raw_tokens)
+                return [
+                    (idx, _normalize_token(word))
+                    for idx, (word, pos) in enumerate(tagged)
+                    if pos.startswith("NN") and _WORD_RE.fullmatch(word) and _normalize_token(word)
+                ]
+            except Exception:
+                pass
+        return [
+            (idx, _normalize_token(token))
+            for idx, token in enumerate(_WORD_RE.findall(str(text).lower()))
+            if _normalize_token(token)
+        ]
+
+    def caption_to_words(self, caption: str, protocol: str = "native") -> tuple[List[str], List[str], List[int]]:
+        mentions = self.caption_to_mentions(caption, protocol=protocol)
+        return (
+            [str(mention["surface"]) for mention in mentions],
+            [str(mention["canonical_name"]) for mention in mentions],
+            [int(mention["word_index"]) for mention in mentions],
+        )
+
+    def caption_to_mentions(
+        self,
+        caption: str,
+        protocol: str = "native",
+        image_id: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        if protocol != "native":
+            raise ValueError(f"AMBER only supports protocol='native', got {protocol!r}")
+
+        safe_map: Dict[str, str] = {}
+        hallu_map: Dict[str, str] = {}
+        if image_id is not None:
+            safe_map, hallu_map = self._image_word_maps(int(image_id))
+
+        mentions: List[Dict[str, Any]] = []
+        for word_index, noun in self._extract_candidate_nouns(caption):
+            if noun in self.global_safe_words:
+                continue
+            if noun not in self.amber_vocabulary and noun not in safe_map and noun not in hallu_map:
+                continue
+
+            hallucinated = 0
+            canonical = self.native_alias_to_canonical.get(noun, noun)
+            if image_id is not None:
+                if noun in safe_map:
+                    canonical = safe_map[noun]
+                    hallucinated = 0
+                elif noun in hallu_map:
+                    canonical = hallu_map[noun]
+                    hallucinated = 1
+                else:
+                    canonical = noun
+                    hallucinated = 1
+
+            variants = [noun, canonical]
+            variants.extend(self._relation_aliases(canonical))
+            mentions.append(
+                {
+                    "surface": noun,
+                    "surface_word": noun,
+                    "phrase": noun,
+                    "canonical_name": canonical,
+                    "word_index": word_index,
+                    "mention_index": len(mentions),
+                    "token_start": word_index,
+                    "token_end": word_index + 1,
+                    "hallucinated": int(hallucinated),
+                    "alignment_variants": _dedupe_preserve_order([value for value in variants if value]),
+                }
+            )
+        return mentions
+
+    def ground_truth_entry(self, image_id: int, protocol: str = "native") -> Dict[str, Any]:
+        image_id = int(image_id)
+        metadata = self.protocol_metadata(protocol)
+        return {
+            "image_id": image_id,
+            "image": self.image_id_to_filename.get(image_id, self.image_filename(image_id)),
+            "dataset": metadata["dataset"],
+            "dataset_version": metadata["dataset_version"],
+            "split": metadata["split"],
+            "protocol": metadata["protocol"],
+            "taxonomy_space": metadata["taxonomy_space"],
+            "lexicon_version": metadata["lexicon_version"],
+            "objects": list(self.image_id_to_truth_objects.get(image_id, [])),
+            "amber_hallucination_candidates": list(self.image_id_to_hallu_objects.get(image_id, [])),
+        }
+
+    def evaluate_caption(self, image_id: int, caption: str, protocol: str = "native") -> Dict[str, Any]:
+        image_id = int(image_id)
+        gt_objects = set(self.image_id_to_truth_objects.get(image_id, []))
+        hallu_objects = set(self.image_id_to_hallu_objects.get(image_id, []))
+        mentions = self.caption_to_mentions(caption, protocol=protocol, image_id=image_id)
+        hallucinated = [mention for mention in mentions if int(mention.get("hallucinated", 0))]
+        recall_mentions = [mention for mention in mentions if not int(mention.get("hallucinated", 0))]
+        recalled_truth = {str(mention["canonical_name"]) for mention in recall_mentions if mention["canonical_name"] in gt_objects}
+        recalled_hallu = {str(mention["canonical_name"]) for mention in hallucinated if mention["canonical_name"] in hallu_objects}
+        metadata = self.protocol_metadata(protocol)
+        return {
+            "image_id": image_id,
+            "caption": caption,
+            "ground_truth_objects": sorted(gt_objects),
+            "object_mentions": mentions,
+            "hallucinated_mentions": hallucinated,
+            "recall_mentions": recall_mentions,
+            "mention_linker_backend": self.mention_linker_backend,
+            "taxonomy_backend": metadata["taxonomy_backend"],
+            "protocol": protocol,
+            "taxonomy_space": metadata["taxonomy_space"],
+            "dataset_version": self.dataset_version,
+            "lexicon_version": metadata["lexicon_version"],
+            "chair_backend": f"{metadata['taxonomy_backend']}:{self.mention_linker_backend}",
+            "chair_word_count_total": len(mentions),
+            "chair_s": 1.0 if hallucinated else 0.0,
+            "chair_i": float(len(hallucinated) / len(mentions)) if mentions else 0.0,
+            "recall": float(len(recalled_truth) / len(gt_objects)) if gt_objects else 0.0,
+            "gt_category_count": len(gt_objects),
+            "evaluated_gt_category_count": len(gt_objects),
+            "gt_category_coverage": 1.0 if gt_objects else 0.0,
+            "amber_truth_coverage": float(len(recalled_truth) / len(gt_objects)) if gt_objects else 0.0,
+            "amber_hallu_candidate_coverage": float(len(recalled_hallu) / len(hallu_objects)) if hallu_objects else 0.0,
+        }
+
+    def image_filename(self, image_id: int) -> str:
+        return self.image_id_to_filename.get(int(image_id), f"AMBER_{int(image_id)}.jpg")
+
+
+class AmberDiscriminativeDatasetAdapter(RuleAliasDatasetAdapter):
+    dataset_name = "amber_discriminative"
+    dataset_version = "1.0"
+    native_taxonomy_space = "amber_discriminative"
+    lexicon_version = "amber_discriminative_truth_v1"
+    mention_linker_backend = "amber_yes_no_token_linker"
+
+    QUERY_FILES = {
+        "val": "query_discriminative.json",
+        "all": "query_discriminative.json",
+        "d": "query_discriminative.json",
+        "existence": "query_discriminative-existence.json",
+        "de": "query_discriminative-existence.json",
+        "attribute": "query_discriminative-attribute.json",
+        "da": "query_discriminative-attribute.json",
+        "relation": "query_discriminative-relation.json",
+        "dr": "query_discriminative-relation.json",
+    }
+
+    def __init__(
+        self,
+        dataset_root: str | Path,
+        annotation_path: str | Path,
+        split: str = "val",
+        query_path: str | Path | None = None,
+    ) -> None:
+        source = Path(annotation_path)
+        data_dir = source if source.is_dir() else source.parent
+        self.annotation_file = source / "annotations.json" if source.is_dir() else source
+        self.query_path = Path(query_path) if query_path is not None else self._default_query_path(data_dir, split)
+        self.sample_records: Dict[int, Dict[str, Any]] = {}
+        super().__init__(dataset_root=dataset_root, annotation_path=annotation_path, split=split)
+
+    @classmethod
+    def from_cache(
+        cls,
+        dataset_root: str | Path,
+        annotation_path: str | Path,
+        split: str = "val",
+        cache_path: str | Path | None = None,
+        query_path: str | Path | None = None,
+    ) -> "AmberDiscriminativeDatasetAdapter":
+        cache = Path(cache_path) if cache_path is not None else None
+        root = Path(dataset_root)
+        source = Path(annotation_path)
+        data_dir = source if source.is_dir() else source.parent
+        annotation_file = source / "annotations.json" if source.is_dir() else source
+        query = Path(query_path) if query_path is not None else cls._default_query_path(data_dir, split)
+
+        if cache is not None and cache.exists():
+            if cache.suffix == ".pkl":
+                adapter = _load_pickled_adapter(cache)
+                if adapter is None:
+                    adapter = cls(dataset_root=root, annotation_path=source, split=split, query_path=query)
+                    adapter.save_cache(cache)
+                    return adapter
+            else:
+                payload = _read_json(cache)
+                adapter = cls.__new__(cls)
+                adapter.category_id_to_name = {int(k): str(v) for k, v in payload["category_id_to_name"].items()}
+                adapter.image_id_to_objects = {
+                    int(k): set(str(value) for value in values)
+                    for k, values in payload["image_id_to_objects"].items()
+                }
+                adapter.image_id_to_filename = {int(k): str(v) for k, v in payload["image_id_to_filename"].items()}
+                adapter.image_id_to_references = {
+                    int(k): [str(value) for value in values]
+                    for k, values in payload.get("image_id_to_references", {}).items()
+                }
+                adapter.split_image_ids = [int(value) for value in payload["split_image_ids"]]
+                adapter.sample_records = {
+                    int(k): dict(value) for k, value in payload.get("sample_records", {}).items()
+                }
+            adapter.dataset_root = root
+            adapter.annotation_path = source
+            adapter.annotation_source = annotation_file
+            adapter.annotation_file = annotation_file
+            adapter.query_path = query
+            adapter.split = str(split)
+            adapter._ensure_runtime_state()
+            return adapter
+
+        adapter = cls(dataset_root=root, annotation_path=source, split=split, query_path=query)
+        if cache is not None:
+            adapter.save_cache(cache)
+        return adapter
+
+    @classmethod
+    def _default_query_path(cls, data_dir: Path, split: str) -> Path:
+        key = str(split).strip().lower()
+        filename = cls.QUERY_FILES.get(key)
+        if filename is None:
+            raise ValueError(
+                "AMBER discriminative split must be one of "
+                "val/all/d, existence/de, attribute/da, or relation/dr."
+            )
+        return data_dir / "query" / filename
+
+    def to_json(self) -> Dict[str, Any]:
+        payload = super().to_json()
+        payload["sample_records"] = {str(k): v for k, v in self.sample_records.items()}
+        return payload
+
+    def _ensure_runtime_state(self) -> None:
+        super()._ensure_runtime_state()
+
+    def _build_native_alias_groups(self) -> List[List[str]]:
+        return [["yes"], ["no"], ["invalid"]]
+
+    def _load_annotation_map(self) -> Dict[int, Dict[str, Any]]:
+        if not self.annotation_file.exists():
+            raise FileNotFoundError(f"AMBER annotation file not found: {self.annotation_file}")
+        payload = json.loads(self.annotation_file.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError(f"AMBER annotations must be a JSON list: {self.annotation_file}")
+        return {int(item["id"]): dict(item) for item in payload}
+
+    def _load_query_rows(self) -> List[Dict[str, Any]]:
+        if not self.query_path.exists():
+            raise FileNotFoundError(f"AMBER discriminative query file not found: {self.query_path}")
+        payload = json.loads(self.query_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError(f"AMBER discriminative queries must be a JSON list: {self.query_path}")
+        return payload
+
+    def _clean_question(self, question: str) -> str:
+        text = str(question).replace("<image>", " ")
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _load_annotations(self) -> None:
+        annotation_by_id = self._load_annotation_map()
+        self.category_id_to_name = {1: "correct_yes_no", 2: "incorrect_yes_no"}
+
+        for row in tqdm(self._load_query_rows(), desc="Loading AMBER discriminative queries", unit="query", leave=False):
+            query_id = int(row["id"])
+            annotation = annotation_by_id.get(query_id)
+            if annotation is None:
+                continue
+            truth = str(annotation.get("truth", "")).strip().lower()
+            if truth not in {"yes", "no"}:
+                continue
+            image_name = str(row.get("image") or "")
+            if not image_name:
+                continue
+            task_type = str(annotation.get("type") or "discriminative")
+            query = self._clean_question(str(row.get("query") or "Answer yes or no."))
+            self.sample_records[query_id] = {
+                "query_id": query_id,
+                "image": image_name,
+                "query": query,
+                "truth": truth,
+                "type": task_type,
+            }
+            self.image_id_to_filename[query_id] = image_name
+            self.image_id_to_objects[query_id] = {"correct_yes_no", "incorrect_yes_no"}
+            self.split_image_ids.append(query_id)
+
+        self.split_image_ids = sorted(self.split_image_ids)
+
+    def question_for_image_id(self, image_id: int) -> str:
+        query = str(self.sample_records[int(image_id)]["query"])
+        return f"{query} Answer with Yes or No."
+
+    def _extract_yes_no(self, response: str) -> tuple[str | None, str | None, int | None]:
+        match = re.search(r"\b(yes|no)\b", str(response), flags=re.IGNORECASE)
+        if match is None:
+            return None, None, None
+        return match.group(1).lower(), match.group(0), int(match.start())
+
+    def _fallback_surface(self, response: str) -> tuple[str, int]:
+        match = re.search(r"\S+", str(response))
+        if match is None:
+            return "", 0
+        return match.group(0), int(match.start())
+
+    def _answer_variants(self, surface: str, canonical: str) -> List[str]:
+        variants = [surface, surface.strip(), canonical, canonical.title(), canonical.upper()]
+        return _dedupe_preserve_order([value for value in variants if str(value).strip()])
+
+    def caption_to_mentions(
+        self,
+        caption: str,
+        protocol: str = "native",
+        image_id: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        if protocol != "native":
+            raise ValueError(f"AMBER discriminative only supports protocol='native', got {protocol!r}")
+        if image_id is None:
+            return []
+        record = self.sample_records[int(image_id)]
+        truth = str(record["truth"])
+        prediction, surface, start = self._extract_yes_no(caption)
+        valid_answer = prediction is not None
+        if prediction is None or surface is None or start is None:
+            surface, start = self._fallback_surface(caption)
+            prediction = "invalid"
+        if not surface:
+            return []
+        hallucinated = int((prediction if valid_answer else None) != truth)
+        return [
+            {
+                "kind": "amber_yes_no_answer",
+                "surface": surface,
+                "surface_word": surface,
+                "phrase": surface,
+                "canonical_name": prediction,
+                "word_index": start,
+                "mention_index": 0,
+                "char_start": start,
+                "char_end": start + len(surface),
+                "amber_discriminative_truth": truth,
+                "amber_discriminative_prediction": prediction,
+                "amber_discriminative_valid_answer": bool(valid_answer),
+                "amber_discriminative_correct": int(valid_answer and prediction == truth),
+                "amber_discriminative_type": record.get("type"),
+                "hallucinated": hallucinated,
+                "alignment_variants": self._answer_variants(surface, prediction),
+            }
+        ]
+
+    def caption_to_words(self, caption: str, protocol: str = "native") -> tuple[List[str], List[str], List[int]]:
+        mentions = self.caption_to_mentions(caption, protocol=protocol)
+        return (
+            [str(mention["surface"]) for mention in mentions],
+            [str(mention["canonical_name"]) for mention in mentions],
+            [int(mention["word_index"]) for mention in mentions],
+        )
+
+    def ground_truth_entry(self, image_id: int, protocol: str = "native") -> Dict[str, Any]:
+        image_id = int(image_id)
+        metadata = self.protocol_metadata(protocol)
+        record = self.sample_records[image_id]
+        return {
+            "image_id": image_id,
+            "image": self.image_id_to_filename[image_id],
+            "dataset": metadata["dataset"],
+            "dataset_version": metadata["dataset_version"],
+            "split": metadata["split"],
+            "protocol": metadata["protocol"],
+            "taxonomy_space": metadata["taxonomy_space"],
+            "lexicon_version": metadata["lexicon_version"],
+            "objects": ["correct_yes_no", "incorrect_yes_no"],
+            "amber_discriminative_query_id": image_id,
+            "amber_discriminative_query": record["query"],
+            "amber_discriminative_truth": record["truth"],
+            "amber_discriminative_type": record["type"],
+        }
+
+    def evaluate_caption(self, image_id: int, caption: str, protocol: str = "native") -> Dict[str, Any]:
+        image_id = int(image_id)
+        mentions = self.caption_to_mentions(caption, protocol=protocol, image_id=image_id)
+        hallucinated = [mention for mention in mentions if int(mention.get("hallucinated", 0))]
+        correct = [mention for mention in mentions if not int(mention.get("hallucinated", 0))]
+        record = self.sample_records[image_id]
+        prediction = mentions[0]["amber_discriminative_prediction"] if mentions else "invalid"
+        valid_answer = bool(mentions[0]["amber_discriminative_valid_answer"]) if mentions else False
+        metadata = self.protocol_metadata(protocol)
+        return {
+            "image_id": image_id,
+            "caption": caption,
+            "ground_truth_objects": ["correct_yes_no", "incorrect_yes_no"],
+            "object_mentions": mentions,
+            "hallucinated_mentions": hallucinated,
+            "recall_mentions": correct,
+            "mention_linker_backend": self.mention_linker_backend,
+            "taxonomy_backend": metadata["taxonomy_backend"],
+            "protocol": protocol,
+            "taxonomy_space": metadata["taxonomy_space"],
+            "dataset_version": self.dataset_version,
+            "lexicon_version": metadata["lexicon_version"],
+            "chair_backend": f"{metadata['taxonomy_backend']}:{self.mention_linker_backend}",
+            "chair_word_count_total": len(mentions),
+            "chair_s": 1.0 if hallucinated else 0.0,
+            "chair_i": float(len(hallucinated) / len(mentions)) if mentions else 0.0,
+            "recall": float(len(correct) / len(mentions)) if mentions else 0.0,
+            "gt_category_count": 1,
+            "evaluated_gt_category_count": len(mentions),
+            "gt_category_coverage": 1.0 if mentions else 0.0,
+            "amber_discriminative_query_id": image_id,
+            "amber_discriminative_query": record["query"],
+            "amber_discriminative_truth": record["truth"],
+            "amber_discriminative_prediction": prediction,
+            "amber_discriminative_valid_answer": valid_answer,
+            "amber_discriminative_correct": int(valid_answer and prediction == record["truth"]),
+            "amber_discriminative_type": record["type"],
+        }
+
+    def protocol_metadata(self, protocol: str) -> Dict[str, str]:
+        payload = super().protocol_metadata(protocol)
+        payload["dataset_version"] = f"{self.dataset_version}:discriminative:{self.split}"
+        return payload
+
+    def image_filename(self, image_id: int) -> str:
+        return self.image_id_to_filename.get(int(image_id), "")
+
+
+class AmberDiscriminativePairedDatasetAdapter(AmberDiscriminativeDatasetAdapter):
+    dataset_name = "amber_discriminative_paired"
+    dataset_version = "1.1"
+    native_taxonomy_space = "amber_discriminative_paired"
+    lexicon_version = "amber_discriminative_paired_truth_v1"
+    mention_linker_backend = "amber_yes_no_paired_token_linker"
+
+    ANSWER_ORDER = ("yes", "no")
+    VIRTUAL_ID_OFFSET = 10_000_000
+
+    @staticmethod
+    def _virtual_image_id(query_id: int, answer: str) -> int:
+        answer_bit = 1 if str(answer).strip().lower() == "yes" else 0
+        return AmberDiscriminativePairedDatasetAdapter.VIRTUAL_ID_OFFSET + int(query_id) * 10 + answer_bit
+
+    def _load_annotations(self) -> None:
+        annotation_by_id = self._load_annotation_map()
+        self.category_id_to_name = {1: "correct_yes_no", 2: "incorrect_yes_no"}
+
+        for row in tqdm(
+            self._load_query_rows(),
+            desc="Loading AMBER discriminative paired queries",
+            unit="query",
+            leave=False,
+        ):
+            query_id = int(row["id"])
+            annotation = annotation_by_id.get(query_id)
+            if annotation is None:
+                continue
+            truth = str(annotation.get("truth", "")).strip().lower()
+            if truth not in {"yes", "no"}:
+                continue
+            image_name = str(row.get("image") or "")
+            if not image_name:
+                continue
+            task_type = str(annotation.get("type") or "discriminative")
+            query = self._clean_question(str(row.get("query") or "Answer yes or no."))
+            self.split_image_ids.append(query_id)
+            for answer in self.ANSWER_ORDER:
+                virtual_id = self._virtual_image_id(query_id, answer)
+                self.sample_records[virtual_id] = {
+                    "query_id": query_id,
+                    "image": image_name,
+                    "query": query,
+                    "truth": truth,
+                    "type": task_type,
+                    "pair_answer": answer,
+                }
+                self.image_id_to_filename[virtual_id] = image_name
+                self.image_id_to_objects[virtual_id] = {"correct_yes_no", "incorrect_yes_no"}
+
+        self.split_image_ids = sorted(self.split_image_ids)
+
+    def expand_sampled_image_ids(self, image_ids: Iterable[int]) -> List[int]:
+        expanded: List[int] = []
+        for image_id in image_ids:
+            value = int(image_id)
+            if value in self.sample_records:
+                expanded.append(value)
+                continue
+            for answer in self.ANSWER_ORDER:
+                virtual_id = self._virtual_image_id(value, answer)
+                if virtual_id in self.sample_records:
+                    expanded.append(virtual_id)
+        return expanded
+
+    def caption_for_image_id(self, image_id: int) -> str:
+        answer = str(self.sample_records[int(image_id)]["pair_answer"]).strip().lower()
+        return "Yes" if answer == "yes" else "No"
+
+    def ground_truth_entry(self, image_id: int, protocol: str = "native") -> Dict[str, Any]:
+        image_id = int(image_id)
+        metadata = self.protocol_metadata(protocol)
+        record = self.sample_records[image_id]
+        return {
+            "image_id": image_id,
+            "image": self.image_id_to_filename[image_id],
+            "dataset": metadata["dataset"],
+            "dataset_version": metadata["dataset_version"],
+            "split": metadata["split"],
+            "protocol": metadata["protocol"],
+            "taxonomy_space": metadata["taxonomy_space"],
+            "lexicon_version": metadata["lexicon_version"],
+            "objects": ["correct_yes_no", "incorrect_yes_no"],
+            "split_group_id": int(record["query_id"]),
+            "amber_discriminative_query_id": int(record["query_id"]),
+            "amber_discriminative_pair_answer": record["pair_answer"],
+            "amber_discriminative_query": record["query"],
+            "amber_discriminative_truth": record["truth"],
+            "amber_discriminative_type": record["type"],
+        }
+
+    def evaluate_caption(self, image_id: int, caption: str, protocol: str = "native") -> Dict[str, Any]:
+        payload = super().evaluate_caption(image_id=image_id, caption=caption, protocol=protocol)
+        record = self.sample_records[int(image_id)]
+        payload["split_group_id"] = int(record["query_id"])
+        payload["amber_discriminative_query_id"] = int(record["query_id"])
+        payload["amber_discriminative_pair_answer"] = record["pair_answer"]
+        payload["amber_discriminative_query"] = record["query"]
+        payload["amber_discriminative_truth"] = record["truth"]
+        payload["amber_discriminative_type"] = record["type"]
+        return payload
+
+    def protocol_metadata(self, protocol: str) -> Dict[str, str]:
+        payload = super().protocol_metadata(protocol)
+        payload["dataset_version"] = f"{self.dataset_version}:discriminative_paired:{self.split}"
+        return payload
+
+
+class PopePairedDatasetAdapter(RuleAliasDatasetAdapter):
+    dataset_name = "pope_paired"
+    dataset_version = "official_coco"
+    native_taxonomy_space = "pope_paired"
+    lexicon_version = "pope_paired_truth_v1"
+    mention_linker_backend = "pope_yes_no_paired_token_linker"
+
+    ANSWER_ORDER = ("yes", "no")
+    VIRTUAL_ID_OFFSET = 20_000_000
+    SUBSET_OFFSETS = {
+        "random": 100_000,
+        "popular": 200_000,
+        "adversarial": 300_000,
+    }
+    SUBSET_FILES = {
+        "random": "coco_pope_random.json",
+        "popular": "coco_pope_popular.json",
+        "adversarial": "coco_pope_adversarial.json",
+    }
+
+    def __init__(
+        self,
+        dataset_root: str | Path,
+        annotation_path: str | Path,
+        split: str = "val",
+    ) -> None:
+        self.sample_records: Dict[int, Dict[str, Any]] = {}
+        super().__init__(dataset_root=dataset_root, annotation_path=annotation_path, split=split)
+
+    @classmethod
+    def from_cache(
+        cls,
+        dataset_root: str | Path,
+        annotation_path: str | Path,
+        split: str = "val",
+        cache_path: str | Path | None = None,
+    ) -> "PopePairedDatasetAdapter":
+        cache = Path(cache_path) if cache_path is not None else None
+        root = Path(dataset_root)
+        source = Path(annotation_path)
+        if cache is not None and cache.exists():
+            if cache.suffix == ".pkl":
+                adapter = _load_pickled_adapter(cache)
+                if adapter is None:
+                    adapter = cls(dataset_root=root, annotation_path=source, split=split)
+                    adapter.save_cache(cache)
+                    return adapter
+            else:
+                payload = _read_json(cache)
+                adapter = cls.__new__(cls)
+                adapter.category_id_to_name = {int(k): str(v) for k, v in payload["category_id_to_name"].items()}
+                adapter.image_id_to_objects = {
+                    int(k): set(str(value) for value in values)
+                    for k, values in payload["image_id_to_objects"].items()
+                }
+                adapter.image_id_to_filename = {int(k): str(v) for k, v in payload["image_id_to_filename"].items()}
+                adapter.image_id_to_references = {
+                    int(k): [str(value) for value in values]
+                    for k, values in payload.get("image_id_to_references", {}).items()
+                }
+                adapter.split_image_ids = [int(value) for value in payload["split_image_ids"]]
+                adapter.sample_records = {
+                    int(k): dict(value) for k, value in payload.get("sample_records", {}).items()
+                }
+            adapter.dataset_root = root
+            adapter.annotation_path = source
+            adapter.annotation_source = source
+            adapter.split = str(split)
+            adapter._ensure_runtime_state()
+            return adapter
+
+        adapter = cls(dataset_root=root, annotation_path=source, split=split)
+        if cache is not None:
+            adapter.save_cache(cache)
+        return adapter
+
+    def to_json(self) -> Dict[str, Any]:
+        payload = super().to_json()
+        payload["sample_records"] = {str(k): v for k, v in self.sample_records.items()}
+        return payload
+
+    def _build_native_alias_groups(self) -> List[List[str]]:
+        return [["yes"], ["no"], ["invalid"]]
+
+    @classmethod
+    def _virtual_image_id(cls, query_id: int, answer: str) -> int:
+        answer_bit = 1 if str(answer).strip().lower() == "yes" else 0
+        return cls.VIRTUAL_ID_OFFSET + int(query_id) * 10 + answer_bit
+
+    def _subset_files_for_split(self) -> List[tuple[str, Path]]:
+        source = Path(self.annotation_path)
+        split_key = str(self.split).strip().lower()
+        if source.is_file():
+            stem = source.stem.lower()
+            subset = next((name for name in self.SUBSET_FILES if name in stem), split_key or "custom")
+            return [(subset, source)]
+
+        if split_key in {"val", "all", "coco", "pope"}:
+            subsets = ("random", "popular", "adversarial")
+        elif split_key in self.SUBSET_FILES:
+            subsets = (split_key,)
+        else:
+            raise ValueError(
+                "POPE split must be one of val/all/coco, random, popular, or adversarial; "
+                f"got {self.split!r}"
+            )
+
+        files: List[tuple[str, Path]] = []
+        for subset in subsets:
+            path = source / self.SUBSET_FILES[subset]
+            if not path.exists():
+                raise FileNotFoundError(f"POPE annotation file not found: {path}")
+            files.append((subset, path))
+        return files
+
+    def _load_pope_rows(self, path: Path) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        text = path.read_text(encoding="utf-8").strip()
+        if not text:
+            return rows
+        if text.startswith("["):
+            payload = json.loads(text)
+            if not isinstance(payload, list):
+                raise ValueError(f"POPE JSON file must contain a list or JSONL rows: {path}")
+            return [dict(item) for item in payload]
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+    def _clean_question(self, question: str) -> str:
+        text = str(question).replace("<image>", " ")
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _load_annotations(self) -> None:
+        self.category_id_to_name = {1: "correct_yes_no", 2: "incorrect_yes_no"}
+        self.split_image_ids = []
+
+        for subset, path in self._subset_files_for_split():
+            subset_offset = self.SUBSET_OFFSETS.get(subset, 900_000)
+            for row in tqdm(
+                self._load_pope_rows(path),
+                desc=f"Loading POPE {subset}",
+                unit="query",
+                leave=False,
+            ):
+                raw_question_id = int(row["question_id"])
+                query_id = subset_offset + raw_question_id
+                truth = str(row.get("label", "")).strip().lower()
+                if truth not in {"yes", "no"}:
+                    continue
+                image_name = str(row.get("image") or "")
+                if not image_name:
+                    continue
+                query = self._clean_question(str(row.get("text") or "Answer yes or no."))
+                self.split_image_ids.append(query_id)
+                for answer in self.ANSWER_ORDER:
+                    virtual_id = self._virtual_image_id(query_id, answer)
+                    self.sample_records[virtual_id] = {
+                        "query_id": query_id,
+                        "pope_question_id": raw_question_id,
+                        "pope_subset": subset,
+                        "image": image_name,
+                        "query": query,
+                        "truth": truth,
+                        "pair_answer": answer,
+                    }
+                    self.image_id_to_filename[virtual_id] = image_name
+                    self.image_id_to_objects[virtual_id] = {"correct_yes_no", "incorrect_yes_no"}
+
+        self.split_image_ids = sorted(set(self.split_image_ids))
+
+    def expand_sampled_image_ids(self, image_ids: Iterable[int]) -> List[int]:
+        expanded: List[int] = []
+        for image_id in image_ids:
+            value = int(image_id)
+            if value in self.sample_records:
+                expanded.append(value)
+                continue
+            for answer in self.ANSWER_ORDER:
+                virtual_id = self._virtual_image_id(value, answer)
+                if virtual_id in self.sample_records:
+                    expanded.append(virtual_id)
+        return expanded
+
+    def save_ground_truth_jsonl(
+        self,
+        output_path: str | Path,
+        image_ids: Iterable[int] | None = None,
+        limit: int | None = None,
+        protocol: str = "native",
+    ) -> None:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        selected_ids = list(image_ids) if image_ids is not None else list(self.split_image_ids)
+        if limit is not None:
+            selected_ids = selected_ids[:limit]
+        selected_ids = self.expand_sampled_image_ids(selected_ids)
+        with path.open("w", encoding="utf-8") as handle:
+            progress = tqdm(
+                selected_ids,
+                desc=f"Writing {self.dataset_name} ground truth",
+                unit="sample",
+                leave=False,
+            )
+            for image_id in progress:
+                entry = self.ground_truth_entry(image_id, protocol=protocol)
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            progress.close()
+
+    def question_for_image_id(self, image_id: int) -> str:
+        query = str(self.sample_records[int(image_id)]["query"])
+        return f"{query} Answer with Yes or No."
+
+    def caption_for_image_id(self, image_id: int) -> str:
+        answer = str(self.sample_records[int(image_id)]["pair_answer"]).strip().lower()
+        return "Yes" if answer == "yes" else "No"
+
+    def _extract_yes_no(self, response: str) -> tuple[str | None, str | None, int | None]:
+        match = re.search(r"\b(yes|no)\b", str(response), flags=re.IGNORECASE)
+        if match is None:
+            return None, None, None
+        return match.group(1).lower(), match.group(0), int(match.start())
+
+    def _fallback_surface(self, response: str) -> tuple[str, int]:
+        match = re.search(r"\S+", str(response))
+        if match is None:
+            return "", 0
+        return match.group(0), int(match.start())
+
+    def _answer_variants(self, surface: str, canonical: str) -> List[str]:
+        variants = [surface, surface.strip(), canonical, canonical.title(), canonical.upper()]
+        return _dedupe_preserve_order([value for value in variants if str(value).strip()])
+
+    def caption_to_mentions(
+        self,
+        caption: str,
+        protocol: str = "native",
+        image_id: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        if protocol != "native":
+            raise ValueError(f"POPE paired only supports protocol='native', got {protocol!r}")
+        if image_id is None:
+            return []
+        record = self.sample_records[int(image_id)]
+        truth = str(record["truth"])
+        prediction, surface, start = self._extract_yes_no(caption)
+        valid_answer = prediction is not None
+        if prediction is None or surface is None or start is None:
+            surface, start = self._fallback_surface(caption)
+            prediction = "invalid"
+        if not surface:
+            return []
+        hallucinated = int((prediction if valid_answer else None) != truth)
+        return [
+            {
+                "kind": "pope_yes_no_answer",
+                "surface": surface,
+                "surface_word": surface,
+                "phrase": surface,
+                "canonical_name": prediction,
+                "word_index": start,
+                "mention_index": 0,
+                "char_start": start,
+                "char_end": start + len(surface),
+                "pope_query_id": int(record["query_id"]),
+                "pope_question_id": int(record["pope_question_id"]),
+                "pope_subset": record["pope_subset"],
+                "pope_truth": truth,
+                "pope_prediction": prediction,
+                "pope_pair_answer": record["pair_answer"],
+                "pope_valid_answer": bool(valid_answer),
+                "pope_correct": int(valid_answer and prediction == truth),
+                "hallucinated": hallucinated,
+                "alignment_variants": self._answer_variants(surface, prediction),
+            }
+        ]
+
+    def caption_to_words(self, caption: str, protocol: str = "native") -> tuple[List[str], List[str], List[int]]:
+        mentions = self.caption_to_mentions(caption, protocol=protocol)
+        return (
+            [str(mention["surface"]) for mention in mentions],
+            [str(mention["canonical_name"]) for mention in mentions],
+            [int(mention["word_index"]) for mention in mentions],
+        )
+
+    def ground_truth_entry(self, image_id: int, protocol: str = "native") -> Dict[str, Any]:
+        image_id = int(image_id)
+        metadata = self.protocol_metadata(protocol)
+        record = self.sample_records[image_id]
+        return {
+            "image_id": image_id,
+            "image": self.image_id_to_filename[image_id],
+            "dataset": metadata["dataset"],
+            "dataset_version": metadata["dataset_version"],
+            "split": metadata["split"],
+            "protocol": metadata["protocol"],
+            "taxonomy_space": metadata["taxonomy_space"],
+            "lexicon_version": metadata["lexicon_version"],
+            "objects": ["correct_yes_no", "incorrect_yes_no"],
+            "split_group_id": int(record["query_id"]),
+            "pope_query_id": int(record["query_id"]),
+            "pope_question_id": int(record["pope_question_id"]),
+            "pope_subset": record["pope_subset"],
+            "pope_pair_answer": record["pair_answer"],
+            "pope_query": record["query"],
+            "pope_truth": record["truth"],
+        }
+
+    def evaluate_caption(self, image_id: int, caption: str, protocol: str = "native") -> Dict[str, Any]:
+        image_id = int(image_id)
+        mentions = self.caption_to_mentions(caption, protocol=protocol, image_id=image_id)
+        hallucinated = [mention for mention in mentions if int(mention.get("hallucinated", 0))]
+        correct = [mention for mention in mentions if not int(mention.get("hallucinated", 0))]
+        record = self.sample_records[image_id]
+        prediction = mentions[0]["pope_prediction"] if mentions else "invalid"
+        valid_answer = bool(mentions[0]["pope_valid_answer"]) if mentions else False
+        metadata = self.protocol_metadata(protocol)
+        return {
+            "image_id": image_id,
+            "caption": caption,
+            "ground_truth_objects": ["correct_yes_no", "incorrect_yes_no"],
+            "object_mentions": mentions,
+            "hallucinated_mentions": hallucinated,
+            "recall_mentions": correct,
+            "mention_linker_backend": self.mention_linker_backend,
+            "taxonomy_backend": metadata["taxonomy_backend"],
+            "protocol": protocol,
+            "taxonomy_space": metadata["taxonomy_space"],
+            "dataset_version": self.dataset_version,
+            "lexicon_version": metadata["lexicon_version"],
+            "chair_backend": f"{metadata['taxonomy_backend']}:{self.mention_linker_backend}",
+            "chair_word_count_total": len(mentions),
+            "chair_s": 1.0 if hallucinated else 0.0,
+            "chair_i": float(len(hallucinated) / len(mentions)) if mentions else 0.0,
+            "recall": float(len(correct) / len(mentions)) if mentions else 0.0,
+            "gt_category_count": 1,
+            "evaluated_gt_category_count": len(mentions),
+            "gt_category_coverage": 1.0 if mentions else 0.0,
+            "split_group_id": int(record["query_id"]),
+            "pope_query_id": int(record["query_id"]),
+            "pope_question_id": int(record["pope_question_id"]),
+            "pope_subset": record["pope_subset"],
+            "pope_pair_answer": record["pair_answer"],
+            "pope_query": record["query"],
+            "pope_truth": record["truth"],
+            "pope_prediction": prediction,
+            "pope_valid_answer": valid_answer,
+            "pope_correct": int(valid_answer and prediction == record["truth"]),
+        }
+
+    def protocol_metadata(self, protocol: str) -> Dict[str, str]:
+        payload = super().protocol_metadata(protocol)
+        payload["dataset_version"] = f"{self.dataset_version}:paired:{self.split}"
+        return payload
+
+    def image_filename(self, image_id: int) -> str:
+        return self.image_id_to_filename.get(int(image_id), "")
+
+
+class MHalDetectDatasetAdapter(RuleAliasDatasetAdapter):
+    dataset_name = "mhaldetect"
+    dataset_version = "raw"
+    native_taxonomy_space = "mhaldetect_segments"
+    lexicon_version = "mhaldetect_span_labels_v1"
+    mention_linker_backend = "mhaldetect_span_linker"
+
+    LABEL_ACCURATE = "ACCURATE"
+    LABEL_INACCURATE = "INACCURATE"
+    LABEL_ANALYSIS = "ANALYSIS"
+
+    def __init__(
+        self,
+        dataset_root: str | Path,
+        annotation_path: str | Path,
+        split: str = "val",
+    ) -> None:
+        self.sample_records: Dict[int, Dict[str, Any]] = {}
+        super().__init__(dataset_root=dataset_root, annotation_path=annotation_path, split=split)
+
+    @classmethod
+    def from_cache(
+        cls,
+        dataset_root: str | Path,
+        annotation_path: str | Path,
+        split: str = "val",
+        cache_path: str | Path | None = None,
+    ) -> "MHalDetectDatasetAdapter":
+        cache = Path(cache_path) if cache_path is not None else None
+        root = Path(dataset_root)
+        source = Path(annotation_path)
+        if cache is not None and cache.exists():
+            if cache.suffix == ".pkl":
+                adapter = _load_pickled_adapter(cache)
+                if adapter is None:
+                    adapter = cls(dataset_root=root, annotation_path=source, split=split)
+                    adapter.save_cache(cache)
+                    return adapter
+            else:
+                payload = _read_json(cache)
+                adapter = cls.__new__(cls)
+                adapter.category_id_to_name = {int(k): str(v) for k, v in payload["category_id_to_name"].items()}
+                adapter.image_id_to_objects = {
+                    int(k): set(str(value) for value in values)
+                    for k, values in payload["image_id_to_objects"].items()
+                }
+                adapter.image_id_to_filename = {int(k): str(v) for k, v in payload["image_id_to_filename"].items()}
+                adapter.image_id_to_references = {
+                    int(k): [str(value) for value in values]
+                    for k, values in payload.get("image_id_to_references", {}).items()
+                }
+                adapter.split_image_ids = [int(value) for value in payload["split_image_ids"]]
+                adapter.sample_records = {
+                    int(k): dict(value) for k, value in payload.get("sample_records", {}).items()
+                }
+            adapter.dataset_root = root
+            adapter.annotation_path = source
+            adapter.annotation_source = adapter._resolve_annotation_file(source, split)
+            adapter.split = str(split)
+            adapter._ensure_runtime_state()
+            return adapter
+
+        adapter = cls(dataset_root=root, annotation_path=source, split=split)
+        if cache is not None:
+            adapter.save_cache(cache)
+        return adapter
+
+    def to_json(self) -> Dict[str, Any]:
+        payload = super().to_json()
+        payload["sample_records"] = {str(k): v for k, v in self.sample_records.items()}
+        return payload
+
+    def _ensure_runtime_state(self) -> None:
+        super()._ensure_runtime_state()
+        self.segment_labels = [self.LABEL_ACCURATE, self.LABEL_INACCURATE]
+        for record in getattr(self, "sample_records", {}).values():
+            record["question"] = self._clean_question(str(record.get("question") or ""))
+
+    def _build_native_alias_groups(self) -> List[List[str]]:
+        return [["accurate"], ["inaccurate"]]
+
+    def _resolve_annotation_file(self, annotation_path: str | Path, split: str) -> Path:
+        source = Path(annotation_path)
+        if source.is_file():
+            return source
+        split_name = str(split).strip().lower()
+        if split_name not in {"train", "val"}:
+            raise ValueError(f"M-HalDetect split must be 'train' or 'val', got {split!r}")
+        return source / f"{split_name}_raw.json"
+
+    def _load_annotation_rows(self) -> List[Dict[str, Any]]:
+        path = self._resolve_annotation_file(self.annotation_path, self.split)
+        if not path.exists():
+            raise FileNotFoundError(f"M-HalDetect annotation file not found: {path}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError(f"M-HalDetect annotations must be a JSON list: {path}")
+        self.annotation_source = path
+        return payload
+
+    def _load_annotations(self) -> None:
+        rows = self._load_annotation_rows()
+        self.category_id_to_name = {1: "accurate", 2: "inaccurate"}
+
+        for sample_id, row in enumerate(tqdm(rows, desc=f"Loading M-HalDetect {self.split}", unit="sample", leave=False), start=1):
+            image_name = str(row["image"])
+            response = str(row.get("response") or "")
+            question = self._clean_question(str(row.get("question") or "Describe the given image in detail."))
+            annotations = [dict(item) for item in row.get("annotations", [])]
+            self.sample_records[sample_id] = {
+                "sample_id": sample_id,
+                "question": question,
+                "response": response,
+                "image": image_name,
+                "annotations": annotations,
+            }
+            self.image_id_to_filename[sample_id] = image_name
+            self.image_id_to_references[sample_id] = [response]
+            self.image_id_to_objects[sample_id] = {
+                _normalize_canonical_name(item.get("label", ""))
+                for item in annotations
+                if str(item.get("label", "")).upper() in {self.LABEL_ACCURATE, self.LABEL_INACCURATE}
+            }
+            self.split_image_ids.append(sample_id)
+
+        self.split_image_ids = sorted(self.split_image_ids)
+
+    def _clean_question(self, question: str) -> str:
+        text = str(question).strip()
+        text = text.replace("<image>", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+        return text or "Describe the given image in detail."
+
+    def _span_variants(self, text: str) -> List[str]:
+        stripped = str(text).strip()
+        collapsed = re.sub(r"\s+", " ", stripped).strip()
+        trimmed = collapsed.strip(" \t\r\n.,;:")
+        return _dedupe_preserve_order([value for value in [stripped, collapsed, trimmed] if value])
+
+    def question_for_image_id(self, image_id: int) -> str:
+        return str(self.sample_records[int(image_id)]["question"])
+
+    def caption_for_image_id(self, image_id: int) -> str:
+        return str(self.sample_records[int(image_id)]["response"])
+
+    def caption_to_mentions(
+        self,
+        caption: str,
+        protocol: str = "native",
+        image_id: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        if protocol != "native":
+            raise ValueError(f"M-HalDetect only supports protocol='native', got {protocol!r}")
+        if image_id is None:
+            return []
+
+        record = self.sample_records[int(image_id)]
+        mentions: List[Dict[str, Any]] = []
+        for annotation in record.get("annotations", []):
+            label = str(annotation.get("label", "")).upper()
+            if label not in {self.LABEL_ACCURATE, self.LABEL_INACCURATE}:
+                continue
+            text = str(annotation.get("text") or "").strip()
+            if not text:
+                continue
+            start = int(annotation.get("start", 0))
+            end = int(annotation.get("end", start + len(text)))
+            hallucinated = int(label == self.LABEL_INACCURATE)
+            canonical = "inaccurate" if hallucinated else "accurate"
+            mentions.append(
+                {
+                    "kind": "mhaldetect_segment",
+                    "surface": text,
+                    "surface_word": text,
+                    "phrase": text,
+                    "canonical_name": canonical,
+                    "word_index": start,
+                    "mention_index": len(mentions),
+                    "char_start": start,
+                    "char_end": end,
+                    "mhaldetect_label": label,
+                    "hallucinated": hallucinated,
+                    "alignment_variants": self._span_variants(text),
+                }
+            )
+        return mentions
+
+    def caption_to_words(self, caption: str, protocol: str = "native") -> tuple[List[str], List[str], List[int]]:
+        return [], [], []
+
+    def get_ground_truth_objects(self, image_id: int, protocol: str = "native") -> set[str]:
+        return set(self.image_id_to_objects.get(int(image_id), set()))
+
+    def ground_truth_entry(self, image_id: int, protocol: str = "native") -> Dict[str, Any]:
+        image_id = int(image_id)
+        metadata = self.protocol_metadata(protocol)
+        record = self.sample_records[image_id]
+        labels = [
+            str(item.get("label", "")).upper()
+            for item in record.get("annotations", [])
+            if str(item.get("label", "")).upper() in {self.LABEL_ACCURATE, self.LABEL_INACCURATE}
+        ]
+        return {
+            "image_id": image_id,
+            "image": self.image_id_to_filename[image_id],
+            "dataset": metadata["dataset"],
+            "dataset_version": metadata["dataset_version"],
+            "split": metadata["split"],
+            "protocol": metadata["protocol"],
+            "taxonomy_space": metadata["taxonomy_space"],
+            "lexicon_version": metadata["lexicon_version"],
+            "mhaldetect_sample_id": image_id,
+            "mhaldetect_question": record["question"],
+            "mhaldetect_response": record["response"],
+            "mhaldetect_segment_count": len(labels),
+            "mhaldetect_inaccurate_segment_count": sum(int(label == self.LABEL_INACCURATE) for label in labels),
+            "objects": sorted(self.get_ground_truth_objects(image_id, protocol=protocol)),
+        }
+
+    def evaluate_caption(self, image_id: int, caption: str, protocol: str = "native") -> Dict[str, Any]:
+        mentions = self.caption_to_mentions(caption, protocol=protocol, image_id=int(image_id))
+        hallucinated = [mention for mention in mentions if int(mention["hallucinated"])]
+        accurate = [mention for mention in mentions if not int(mention["hallucinated"])]
+        metadata = self.protocol_metadata(protocol)
+        return {
+            "image_id": int(image_id),
+            "caption": caption,
+            "ground_truth_objects": ["accurate", "inaccurate"],
+            "object_mentions": mentions,
+            "hallucinated_mentions": hallucinated,
+            "recall_mentions": accurate,
+            "mention_linker_backend": self.mention_linker_backend,
+            "taxonomy_backend": metadata["taxonomy_backend"],
+            "protocol": protocol,
+            "taxonomy_space": metadata["taxonomy_space"],
+            "dataset_version": self.dataset_version,
+            "lexicon_version": metadata["lexicon_version"],
+            "chair_backend": f"{metadata['taxonomy_backend']}:{self.mention_linker_backend}",
+            "chair_word_count_total": len(mentions),
+            "chair_s": 1.0 if hallucinated else 0.0,
+            "chair_i": float(len(hallucinated) / len(mentions)) if mentions else 0.0,
+            "recall": float(len(accurate) / len(mentions)) if mentions else 0.0,
+            "gt_category_count": len(mentions),
+            "evaluated_gt_category_count": len(mentions),
+            "gt_category_coverage": 1.0 if mentions else 0.0,
+            "mhaldetect_segment_count": len(mentions),
+            "mhaldetect_inaccurate_segment_count": len(hallucinated),
+            "mhaldetect_accurate_segment_count": len(accurate),
+        }
+
+    def protocol_metadata(self, protocol: str) -> Dict[str, str]:
+        payload = super().protocol_metadata(protocol)
+        payload["dataset_version"] = f"{self.dataset_version}:{self.split}"
+        return payload
+
+    def image_filename(self, image_id: int) -> str:
+        return self.image_id_to_filename.get(int(image_id), "")
+
+
 def create_dataset_adapter(
     dataset: str,
     dataset_root: str | Path,
@@ -722,5 +2121,46 @@ def create_dataset_adapter(
             split=split,
             cache_path=cache_path,
             alias_path=lexicon_path,
+        )
+    if normalized_dataset == "amber":
+        return AmberDatasetAdapter.from_cache(
+            dataset_root=dataset_root,
+            annotation_path=annotation_path,
+            split=split,
+            cache_path=cache_path,
+        )
+    if normalized_dataset in {"amber_discriminative", "amber-yn", "amber_yesno"}:
+        return AmberDiscriminativeDatasetAdapter.from_cache(
+            dataset_root=dataset_root,
+            annotation_path=annotation_path,
+            split=split,
+            cache_path=cache_path,
+        )
+    if normalized_dataset in {
+        "amber_discriminative_paired",
+        "amber-discriminative-paired",
+        "amber_yesno_paired",
+        "amber-yn-paired",
+        "amber_paired",
+    }:
+        return AmberDiscriminativePairedDatasetAdapter.from_cache(
+            dataset_root=dataset_root,
+            annotation_path=annotation_path,
+            split=split,
+            cache_path=cache_path,
+        )
+    if normalized_dataset in {"pope", "pope_paired", "pope-paired", "pope_yesno", "pope-yn"}:
+        return PopePairedDatasetAdapter.from_cache(
+            dataset_root=dataset_root,
+            annotation_path=annotation_path,
+            split=split,
+            cache_path=cache_path,
+        )
+    if normalized_dataset in {"mhaldetect", "m-haldetect", "mhal"}:
+        return MHalDetectDatasetAdapter.from_cache(
+            dataset_root=dataset_root,
+            annotation_path=annotation_path,
+            split=split,
+            cache_path=cache_path,
         )
     raise ValueError(f"Unsupported dataset: {dataset}")

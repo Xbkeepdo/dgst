@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
+import re
 from typing import Any, Dict, Iterable, List, Sequence
 
 import torch
@@ -18,7 +19,28 @@ from .reporting import build_dgst_object_record
 
 PROBE_FEATURE_SET_RISK = "risk"
 PROBE_FEATURE_SET_PROBE6 = "probe6"
-PROBE_FEATURE_SET_CHOICES = (PROBE_FEATURE_SET_RISK, PROBE_FEATURE_SET_PROBE6)
+PROBE_FEATURE_SET_PROMPT = "prompt"
+PROBE_FEATURE_SET_RISK_PROMPT = "risk_prompt"
+PROBE_FEATURE_SET_PROBE6_PROMPT = "probe6_prompt"
+PROBE_FEATURE_SET_CHOICES = (
+    PROBE_FEATURE_SET_RISK,
+    PROBE_FEATURE_SET_PROBE6,
+    PROBE_FEATURE_SET_PROMPT,
+    PROBE_FEATURE_SET_RISK_PROMPT,
+    PROBE_FEATURE_SET_PROBE6_PROMPT,
+)
+PROBE_SPLIT_BY_GROUP = "group"
+PROBE_SPLIT_BY_RESPONSE = "response"
+PROBE_SPLIT_BY_IMAGE = "image"
+PROBE_SPLIT_BY_SAMPLE = "sample"
+PROBE_SPLIT_BY_CHOICES = (
+    PROBE_SPLIT_BY_GROUP,
+    PROBE_SPLIT_BY_RESPONSE,
+    PROBE_SPLIT_BY_IMAGE,
+    PROBE_SPLIT_BY_SAMPLE,
+)
+_PROBE_WORD_RE = re.compile(r"[a-z]+(?:'[a-z]+)?")
+_SENTENCE_SPLIT_RE = re.compile(r"(?:\n\s*)+|(?<=[.!?])\s+")
 
 
 @dataclass
@@ -43,6 +65,12 @@ class DGSTProbeSample:
     dgst_probe6_layer_stats: List[Dict[str, Any]]
     object_layer_dgst_probe6: List[float]
     dgst_final_score: float
+    dgst_prompt_feature_names: List[str] = field(default_factory=list)
+    dgst_prompt_layer_stats: List[Dict[str, Any]] = field(default_factory=list)
+    object_layer_prompt_token_cos: List[float] = field(default_factory=list)
+    split_group_id: int | None = None
+    target_aggregation: str = "mean"
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 def dgst_probe_sample_to_dict(sample: DGSTProbeSample) -> Dict[str, Any]:
@@ -86,6 +114,16 @@ def read_dgst_probe_dataset(path: Path) -> List[DGSTProbeSample]:
                     dgst_probe6_layer_stats=list(payload.get("dgst_probe6_layer_stats", [])),
                     object_layer_dgst_probe6=[float(value) for value in payload.get("object_layer_dgst_probe6", [])],
                     dgst_final_score=float(payload["dgst_final_score"]),
+                    dgst_prompt_feature_names=[str(value) for value in payload.get("dgst_prompt_feature_names", [])],
+                    dgst_prompt_layer_stats=list(payload.get("dgst_prompt_layer_stats", [])),
+                    object_layer_prompt_token_cos=[
+                        float(value) for value in payload.get("object_layer_prompt_token_cos", [])
+                    ],
+                    split_group_id=(
+                        int(payload["split_group_id"]) if payload.get("split_group_id") is not None else None
+                    ),
+                    target_aggregation=str(payload.get("target_aggregation") or "mean"),
+                    metadata=dict(payload.get("metadata", {})),
                 )
             )
     return samples
@@ -94,14 +132,29 @@ def read_dgst_probe_dataset(path: Path) -> List[DGSTProbeSample]:
 def build_dgst_probe_samples_from_row(row: Dict[str, Any]) -> List[DGSTProbeSample]:
     samples: List[DGSTProbeSample] = []
     image_id = int(row["image_id"])
-    for item in row.get("dgst_object_scores", []):
+    metadata = {
+        str(key): value
+        for key, value in row.items()
+        if str(key).startswith(("amber_", "mhaldetect_", "pope_", "coco_"))
+    }
+    score_items: List[Dict[str, Any]] = []
+    score_items.extend(dict(item) for item in row.get("dgst_object_scores", []))
+    score_items.extend(dict(item) for item in row.get("dgst_sentence_scores", []))
+    for item in score_items:
         if "hallucinated" not in item:
             continue
-        mention_index = int(item.get("mention_index", len(samples)))
+        item_kind = str(item.get("kind") or "object")
+        mention_index = int(item.get("sentence_index", item.get("mention_index", len(samples))))
+        sample_id = f"{image_id}:sentence:{mention_index}" if item_kind == "sentence" else f"{image_id}:{mention_index}"
         record = build_dgst_object_record(item, int(item["hallucinated"]))
+        item_metadata = {
+            str(key): value
+            for key, value in item.items()
+            if str(key).startswith("sentence_") or str(key) in {"kind", "label_rule", "aggregation_unit"}
+        }
         samples.append(
             DGSTProbeSample(
-                sample_id=f"{image_id}:{mention_index}",
+                sample_id=sample_id,
                 image_id=image_id,
                 image=row.get("image"),
                 image_path=row.get("image_path"),
@@ -121,6 +174,12 @@ def build_dgst_probe_samples_from_row(row: Dict[str, Any]) -> List[DGSTProbeSamp
                 dgst_probe6_layer_stats=list(item.get("dgst_probe6_layer_stats", [])),
                 object_layer_dgst_probe6=[float(value) for value in item.get("object_layer_dgst_probe6", [])],
                 dgst_final_score=float(record.final_score),
+                dgst_prompt_feature_names=[str(value) for value in item.get("dgst_prompt_feature_names", [])],
+                dgst_prompt_layer_stats=list(item.get("dgst_prompt_layer_stats", [])),
+                object_layer_prompt_token_cos=[float(value) for value in item.get("object_layer_prompt_token_cos", [])],
+                split_group_id=int(row["split_group_id"]) if row.get("split_group_id") is not None else None,
+                target_aggregation=str(item.get("target_aggregation") or row.get("target_aggregation") or "mean"),
+                metadata={**metadata, **item_metadata},
             )
         )
     return samples
@@ -136,71 +195,364 @@ def build_dgst_probe_samples(rows: Iterable[Dict[str, Any]]) -> List[DGSTProbeSa
 def summarize_dgst_probe_samples(samples: Sequence[DGSTProbeSample]) -> Dict[str, Any]:
     positives = sum(int(sample.hallucinated) for sample in samples)
     image_ids = {int(sample.image_id) for sample in samples}
+    split_group_ids = {_split_group_id(sample) for sample in samples}
     layer_widths = sorted({len(sample.object_layer_dgst_risk) for sample in samples})
     probe6_widths = sorted({len(sample.object_layer_dgst_probe6) for sample in samples if sample.object_layer_dgst_probe6})
+    prompt_widths = sorted(
+        {len(sample.object_layer_prompt_token_cos) for sample in samples if sample.object_layer_prompt_token_cos}
+    )
     token_aligned = sum(int(sample.token_aligned) for sample in samples)
     return {
         "count": len(samples),
         "positives": positives,
         "negatives": len(samples) - positives,
         "images": len(image_ids),
+        "split_groups": len(split_group_ids),
+        "target_aggregations": sorted({str(sample.target_aggregation) for sample in samples}),
         "layer_widths": layer_widths,
         "probe6_widths": probe6_widths,
+        "prompt_widths": prompt_widths,
         "token_aligned": token_aligned,
     }
+
+
+def _caption_sentence_spans(caption: str | None) -> List[Dict[str, Any]]:
+    text = str(caption or "").strip()
+    if not text:
+        return [{"index": 0, "start_token": 0, "end_token": 1, "char_start": 0, "char_end": 0, "text": ""}]
+
+    spans: List[Dict[str, Any]] = []
+    token_cursor = 0
+    part_start = 0
+    boundaries = list(_SENTENCE_SPLIT_RE.finditer(text))
+    parts = []
+    for boundary in boundaries:
+        parts.append((part_start, boundary.start()))
+        part_start = boundary.end()
+    parts.append((part_start, len(text)))
+
+    for start, end in parts:
+        raw_sentence = text[start:end]
+        sentence = raw_sentence.strip()
+        if not sentence:
+            continue
+        leading = len(raw_sentence) - len(raw_sentence.lstrip())
+        trailing = len(raw_sentence) - len(raw_sentence.rstrip())
+        char_start = start + leading
+        char_end = end - trailing
+        token_count = len(_PROBE_WORD_RE.findall(sentence.lower()))
+        if token_count <= 0:
+            continue
+        spans.append(
+            {
+                "index": len(spans),
+                "start_token": token_cursor,
+                "end_token": token_cursor + token_count,
+                "char_start": int(char_start),
+                "char_end": int(char_end),
+                "text": sentence,
+            }
+        )
+        token_cursor += token_count
+
+    if not spans:
+        token_count = max(1, len(_PROBE_WORD_RE.findall(text.lower())))
+        spans.append({"index": 0, "start_token": 0, "end_token": token_count, "char_start": 0, "char_end": len(text), "text": text})
+    return spans
+
+
+def _sentence_for_word_index(word_index: int | None, spans: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    if not spans:
+        return {"index": 0, "start_token": 0, "end_token": 1, "text": ""}
+    if word_index is None:
+        return spans[0]
+    token_index = int(word_index)
+    for span in spans:
+        if int(span["start_token"]) <= token_index < int(span["end_token"]):
+            return span
+    return spans[-1] if token_index >= int(spans[-1]["end_token"]) else spans[0]
+
+
+def build_sentence_entries_from_mentions(
+    caption: str | None,
+    object_mentions: Sequence[Dict[str, Any]],
+    *,
+    include_empty_sentences: bool = True,
+) -> List[Dict[str, Any]]:
+    spans = _caption_sentence_spans(caption)
+    grouped: Dict[int, List[Dict[str, Any]]] = {int(span["index"]): [] for span in spans}
+    for mention in object_mentions:
+        sentence = _sentence_for_word_index(
+            int(mention["word_index"]) if mention.get("word_index") is not None else None,
+            spans,
+        )
+        grouped.setdefault(int(sentence["index"]), []).append(dict(mention))
+
+    entries: List[Dict[str, Any]] = []
+    for span in spans:
+        sentence_index = int(span["index"])
+        mentions = grouped.get(sentence_index, [])
+        if not mentions and not include_empty_sentences:
+            continue
+        hallucinated_mentions = [mention for mention in mentions if int(mention.get("hallucinated", 0))]
+        surfaces = [str(mention.get("surface") or mention.get("phrase") or "") for mention in mentions]
+        canonicals = [str(mention.get("canonical_name") or "") for mention in mentions]
+        sentence_text = str(span["text"])
+        entries.append(
+            {
+                "kind": "sentence",
+                "phrase": sentence_text,
+                "surface": sentence_text,
+                "surface_word": sentence_text,
+                "canonical_name": "sentence",
+                "mention_index": sentence_index,
+                "word_index": int(span["start_token"]),
+                "hallucinated": int(bool(hallucinated_mentions)),
+                "sentence_index": sentence_index,
+                "sentence_text": sentence_text,
+                "sentence_start_token": int(span["start_token"]),
+                "sentence_end_token": int(span["end_token"]),
+                "sentence_char_start": int(span["char_start"]),
+                "sentence_char_end": int(span["char_end"]),
+                "sentence_mention_count": int(len(mentions)),
+                "sentence_hallucinated_mention_count": int(len(hallucinated_mentions)),
+                "sentence_surfaces": surfaces,
+                "sentence_canonical_names": canonicals,
+            }
+        )
+    return entries
+
+
+def _aggregate_vectors(vectors: Sequence[Sequence[float]], aggregation: str) -> List[float]:
+    if not vectors:
+        return []
+    width = len(vectors[0])
+    if any(len(vector) != width for vector in vectors):
+        raise ValueError("Cannot aggregate vectors with different widths.")
+    if aggregation == "mean":
+        return [float(sum(float(vector[index]) for vector in vectors) / len(vectors)) for index in range(width)]
+    if aggregation == "max":
+        return [float(max(float(vector[index]) for vector in vectors)) for index in range(width)]
+    raise ValueError(f"Unsupported sentence feature aggregation: {aggregation}")
+
+
+def _aggregate_layer_stats(layer_stats: Sequence[Sequence[Dict[str, Any]]], aggregation: str) -> List[Dict[str, Any]]:
+    if not layer_stats:
+        return []
+    width = len(layer_stats[0])
+    if any(len(stats) != width for stats in layer_stats):
+        return [dict(item) for item in layer_stats[0]]
+    aggregated: List[Dict[str, Any]] = []
+    for layer_index in range(width):
+        keys = sorted({key for stats in layer_stats for key in stats[layer_index].keys()})
+        row: Dict[str, Any] = {}
+        for key in keys:
+            values = [stats[layer_index].get(key) for stats in layer_stats]
+            if all(isinstance(value, (int, float)) for value in values):
+                numeric_values = [float(value) for value in values]
+                row[key] = (
+                    float(sum(numeric_values) / len(numeric_values))
+                    if aggregation == "mean"
+                    else float(max(numeric_values))
+                )
+            else:
+                row[key] = values[0]
+        aggregated.append(row)
+    return aggregated
+
+
+def aggregate_dgst_probe_samples_by_sentence(
+    samples: Sequence[DGSTProbeSample],
+    *,
+    feature_aggregation: str = "mean",
+) -> List[DGSTProbeSample]:
+    if feature_aggregation not in {"mean", "max"}:
+        raise ValueError("feature_aggregation must be either 'mean' or 'max'.")
+
+    caption_spans: Dict[tuple[int, str], List[Dict[str, Any]]] = {}
+    grouped: Dict[tuple[int, int, str], List[DGSTProbeSample]] = {}
+    sentence_meta: Dict[tuple[int, int, str], Dict[str, Any]] = {}
+
+    for sample in samples:
+        caption = sample.caption or ""
+        caption_key = (int(sample.image_id), caption)
+        spans = caption_spans.setdefault(caption_key, _caption_sentence_spans(caption))
+        sentence = _sentence_for_word_index(sample.word_index, spans)
+        key = (int(sample.image_id), int(sentence["index"]), caption)
+        grouped.setdefault(key, []).append(sample)
+        sentence_meta[key] = sentence
+
+    sentence_samples: List[DGSTProbeSample] = []
+    for key in sorted(grouped, key=lambda item: (item[0], item[1], item[2])):
+        group = grouped[key]
+        first = group[0]
+        sentence = sentence_meta[key]
+        sentence_index = int(sentence["index"])
+        hallucinated = int(any(int(sample.hallucinated) for sample in group))
+        surfaces = [str(sample.surface or sample.phrase or sample.canonical_name or "") for sample in group]
+        canonicals = [str(sample.canonical_name or "") for sample in group]
+        metadata = dict(first.metadata)
+        metadata.update(
+            {
+                "aggregation_unit": "sentence",
+                "feature_aggregation": feature_aggregation,
+                "label_rule": "positive_if_any_object_mention_hallucinated",
+                "source_caption": first.caption,
+                "sentence_index": sentence_index,
+                "sentence_text": sentence["text"],
+                "sentence_start_token": int(sentence["start_token"]),
+                "sentence_end_token": int(sentence["end_token"]),
+                "sentence_mention_count": int(len(group)),
+                "sentence_hallucinated_mention_count": int(sum(int(sample.hallucinated) for sample in group)),
+                "sentence_surfaces": surfaces,
+                "sentence_canonical_names": canonicals,
+                "source_sample_ids": [sample.sample_id for sample in group],
+            }
+        )
+        sentence_samples.append(
+            DGSTProbeSample(
+                sample_id=f"{first.image_id}:sent{sentence_index}",
+                image_id=int(first.image_id),
+                image=first.image,
+                image_path=first.image_path,
+                caption=str(sentence["text"]),
+                canonical_name="; ".join(dict.fromkeys(value for value in canonicals if value)) or "sentence",
+                surface=str(sentence["text"]),
+                phrase=str(sentence["text"]),
+                source_surface_word="; ".join(value for value in surfaces if value) or None,
+                hallucinated=hallucinated,
+                word_index=int(sentence["start_token"]),
+                alignment_strategy=f"sentence_object_mention_{feature_aggregation}",
+                alignment_status="sentence_aggregated",
+                token_aligned=all(bool(sample.token_aligned) for sample in group),
+                layer_ids=list(first.layer_ids),
+                object_layer_dgst_risk=_aggregate_vectors(
+                    [sample.object_layer_dgst_risk for sample in group],
+                    feature_aggregation,
+                ),
+                dgst_probe6_feature_names=list(first.dgst_probe6_feature_names),
+                dgst_probe6_layer_stats=_aggregate_layer_stats(
+                    [sample.dgst_probe6_layer_stats for sample in group if sample.dgst_probe6_layer_stats],
+                    feature_aggregation,
+                ),
+                object_layer_dgst_probe6=_aggregate_vectors(
+                    [sample.object_layer_dgst_probe6 for sample in group if sample.object_layer_dgst_probe6],
+                    feature_aggregation,
+                ),
+                dgst_final_score=float(
+                    _aggregate_vectors([[sample.dgst_final_score] for sample in group], feature_aggregation)[0]
+                ),
+                dgst_prompt_feature_names=list(first.dgst_prompt_feature_names),
+                dgst_prompt_layer_stats=_aggregate_layer_stats(
+                    [sample.dgst_prompt_layer_stats for sample in group if sample.dgst_prompt_layer_stats],
+                    feature_aggregation,
+                ),
+                object_layer_prompt_token_cos=_aggregate_vectors(
+                    [sample.object_layer_prompt_token_cos for sample in group if sample.object_layer_prompt_token_cos],
+                    feature_aggregation,
+                ),
+                split_group_id=int(first.image_id),
+                target_aggregation=f"sentence_{feature_aggregation}",
+                metadata=metadata,
+            )
+        )
+    return sentence_samples
+
+
+def _require_prompt_features(sample: DGSTProbeSample) -> List[float]:
+    if not sample.object_layer_prompt_token_cos:
+        raise ValueError(
+            "Probe sample does not contain object_layer_prompt_token_cos. "
+            "Re-export the probe dataset after enabling prompt-aware feature export."
+        )
+    return list(sample.object_layer_prompt_token_cos)
+
+
+def _require_probe6_features(sample: DGSTProbeSample) -> List[float]:
+    if not sample.object_layer_dgst_probe6:
+        raise ValueError(
+            "Probe sample does not contain object_layer_dgst_probe6. "
+            "Re-export the probe dataset after enabling the probe6 feature implementation."
+        )
+    return list(sample.object_layer_dgst_probe6)
 
 
 def get_probe_feature_vector(sample: DGSTProbeSample, feature_set: str) -> List[float]:
     if feature_set == PROBE_FEATURE_SET_RISK:
         return list(sample.object_layer_dgst_risk)
     if feature_set == PROBE_FEATURE_SET_PROBE6:
-        if not sample.object_layer_dgst_probe6:
-            raise ValueError(
-                "Probe sample does not contain object_layer_dgst_probe6. "
-                "Re-export the probe dataset after enabling the probe6 feature implementation."
-            )
-        return list(sample.object_layer_dgst_probe6)
+        return _require_probe6_features(sample)
+    if feature_set == PROBE_FEATURE_SET_PROMPT:
+        return _require_prompt_features(sample)
+    if feature_set == PROBE_FEATURE_SET_RISK_PROMPT:
+        return list(sample.object_layer_dgst_risk) + _require_prompt_features(sample)
+    if feature_set == PROBE_FEATURE_SET_PROBE6_PROMPT:
+        return _require_probe6_features(sample) + _require_prompt_features(sample)
     raise ValueError(f"Unsupported probe feature set: {feature_set}")
+
+
+def _split_group_id(sample: DGSTProbeSample) -> int:
+    return int(sample.split_group_id) if sample.split_group_id is not None else int(sample.image_id)
+
+
+def _source_image_key(sample: DGSTProbeSample) -> str:
+    return str(sample.image_path or sample.image or sample.image_id)
+
+
+def _split_key(sample: DGSTProbeSample, split_by: str) -> str:
+    if split_by == PROBE_SPLIT_BY_GROUP:
+        return str(_split_group_id(sample))
+    if split_by == PROBE_SPLIT_BY_RESPONSE:
+        return str(sample.image_id)
+    if split_by == PROBE_SPLIT_BY_IMAGE:
+        return _source_image_key(sample)
+    if split_by == PROBE_SPLIT_BY_SAMPLE:
+        return str(sample.sample_id)
+    raise ValueError(f"Unsupported probe split_by: {split_by}")
 
 
 def split_dgst_probe_samples_by_image(
     samples: Sequence[DGSTProbeSample],
     test_size: float,
     seed: int,
+    split_by: str = PROBE_SPLIT_BY_GROUP,
 ) -> tuple[List[DGSTProbeSample], List[DGSTProbeSample], Dict[str, Any]]:
-    grouped: dict[int, List[DGSTProbeSample]] = {}
+    grouped: dict[str, List[DGSTProbeSample]] = {}
     for sample in samples:
-        grouped.setdefault(int(sample.image_id), []).append(sample)
+        grouped.setdefault(_split_key(sample, split_by), []).append(sample)
 
     if len(grouped) < 2:
-        raise ValueError("At least two images are required to split DGST probe data.")
+        raise ValueError("At least two split groups are required to split DGST probe data.")
 
-    image_ids = sorted(grouped.keys())
-    image_labels = [int(any(sample.hallucinated for sample in grouped[image_id])) for image_id in image_ids]
+    split_keys = sorted(grouped.keys())
+    image_labels = [int(any(sample.hallucinated for sample in grouped[key])) for key in split_keys]
 
     positives = sum(image_labels)
     negatives = len(image_labels) - positives
     stratify = image_labels if positives >= 2 and negatives >= 2 else None
 
     train_ids, val_ids = train_test_split(
-        image_ids,
+        split_keys,
         test_size=test_size,
         random_state=seed,
         shuffle=True,
         stratify=stratify,
     )
-    train_id_set = set(int(value) for value in train_ids)
-    val_id_set = set(int(value) for value in val_ids)
+    train_id_set = set(str(value) for value in train_ids)
+    val_id_set = set(str(value) for value in val_ids)
 
-    train_samples = [sample for sample in samples if int(sample.image_id) in train_id_set]
-    val_samples = [sample for sample in samples if int(sample.image_id) in val_id_set]
+    train_samples = [sample for sample in samples if _split_key(sample, split_by) in train_id_set]
+    val_samples = [sample for sample in samples if _split_key(sample, split_by) in val_id_set]
     if not train_samples or not val_samples:
         raise ValueError("The DGST probe split produced an empty train or validation set.")
 
     split_summary = {
         "seed": int(seed),
         "test_size": float(test_size),
+        "split_by": split_by,
         "stratified_by_image_has_hallucination": bool(stratify is not None),
+        "train_split_keys": sorted(train_id_set),
+        "val_split_keys": sorted(val_id_set),
         "train_image_ids": sorted(train_id_set),
         "val_image_ids": sorted(val_id_set),
         "train_image_count": len(train_id_set),
@@ -213,18 +565,19 @@ def split_dgst_probe_samples_by_image(
 
 def split_dgst_probe_samples_with_fixed_image_ids(
     samples: Sequence[DGSTProbeSample],
-    train_image_ids: Sequence[int],
-    val_image_ids: Sequence[int],
+    train_image_ids: Sequence[Any],
+    val_image_ids: Sequence[Any],
+    split_by: str = PROBE_SPLIT_BY_GROUP,
 ) -> tuple[List[DGSTProbeSample], List[DGSTProbeSample], Dict[str, Any]]:
-    train_id_set = {int(value) for value in train_image_ids}
-    val_id_set = {int(value) for value in val_image_ids}
+    train_id_set = {str(value) for value in train_image_ids}
+    val_id_set = {str(value) for value in val_image_ids}
     if not train_id_set or not val_id_set:
         raise ValueError("Both train_image_ids and val_image_ids must be non-empty.")
     overlap = train_id_set & val_id_set
     if overlap:
         raise ValueError(f"Train/val image ids overlap: {len(overlap)} images.")
 
-    image_ids_in_dataset = {int(sample.image_id) for sample in samples}
+    image_ids_in_dataset = {_split_key(sample, split_by) for sample in samples}
     missing_train = sorted(train_id_set - image_ids_in_dataset)
     missing_val = sorted(val_id_set - image_ids_in_dataset)
     if missing_train:
@@ -236,15 +589,18 @@ def split_dgst_probe_samples_with_fixed_image_ids(
             "After dropping absent image ids from the fixed split, train or validation ids became empty."
         )
 
-    train_samples = [sample for sample in samples if int(sample.image_id) in train_id_set]
-    val_samples = [sample for sample in samples if int(sample.image_id) in val_id_set]
+    train_samples = [sample for sample in samples if _split_key(sample, split_by) in train_id_set]
+    val_samples = [sample for sample in samples if _split_key(sample, split_by) in val_id_set]
     if not train_samples or not val_samples:
         raise ValueError("The fixed DGST split produced an empty train or validation set.")
 
     split_summary = {
         "split_source": "fixed_image_ids",
+        "split_by": split_by,
         "missing_train_image_ids": missing_train,
         "missing_val_image_ids": missing_val,
+        "train_split_keys": sorted(train_id_set),
+        "val_split_keys": sorted(val_id_set),
         "train_image_ids": sorted(train_id_set),
         "val_image_ids": sorted(val_id_set),
         "train_image_count": len(train_id_set),
@@ -270,7 +626,7 @@ class DGSTProbeDataset(Dataset):
             [get_probe_feature_vector(sample, feature_set) for sample in samples],
             dtype=torch.float32,
         )
-        self.labels = torch.tensor([1 - sample.hallucinated for sample in samples], dtype=torch.float32)
+        self.labels = torch.tensor([sample.hallucinated for sample in samples], dtype=torch.float32)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -320,6 +676,7 @@ class DGSTProbe(nn.Module):
 class DGSTProbeConfig:
     input_dim: int
     feature_set: str = PROBE_FEATURE_SET_RISK
+    positive_class: str = "hallucination"
     batch_size: int = 16
     num_epochs: int = 100
     learning_rate: float = 1e-3
@@ -382,7 +739,7 @@ def _validate_epoch(
 ) -> Dict[str, Any]:
     model.eval()
     losses: List[float] = []
-    non_hallucination_probabilities: List[float] = []
+    hallucination_probabilities: List[float] = []
     labels: List[int] = []
 
     with torch.no_grad():
@@ -392,7 +749,7 @@ def _validate_epoch(
             logits = model(features)
             loss = criterion(logits, batch_labels)
             losses.append(float(loss.item()))
-            non_hallucination_probabilities.extend(torch.sigmoid(logits).squeeze(1).cpu().tolist())
+            hallucination_probabilities.extend(torch.sigmoid(logits).squeeze(1).cpu().tolist())
             labels.extend(int(value) for value in batch_labels.squeeze(1).cpu().tolist())
 
     positives = sum(labels)
@@ -400,16 +757,16 @@ def _validate_epoch(
     if positives == 0 or negatives == 0:
         raise ValueError("Validation split must contain both positive and negative samples.")
 
-    roc_auc = float(roc_auc_score(labels, non_hallucination_probabilities))
-    aupr = float(average_precision_score(labels, non_hallucination_probabilities))
-    fpr, tpr, roc_thresholds = roc_curve(labels, non_hallucination_probabilities)
-    pr_precision, pr_recall, pr_thresholds = precision_recall_curve(labels, non_hallucination_probabilities)
+    roc_auc = float(roc_auc_score(labels, hallucination_probabilities))
+    aupr = float(average_precision_score(labels, hallucination_probabilities))
+    fpr, tpr, roc_thresholds = roc_curve(labels, hallucination_probabilities)
+    pr_precision, pr_recall, pr_thresholds = precision_recall_curve(labels, hallucination_probabilities)
     return {
         "val_loss": float(sum(losses) / len(losses)) if losses else 0.0,
         "auroc": roc_auc,
         "aupr": aupr,
         "labels": labels,
-        "non_hallucination_probabilities": non_hallucination_probabilities,
+        "hallucination_probabilities": hallucination_probabilities,
         "roc_curve": {
             "fpr": [float(value) for value in fpr.tolist()],
             "tpr": [float(value) for value in tpr.tolist()],
@@ -420,6 +777,52 @@ def _validate_epoch(
             "recall": [float(value) for value in pr_recall.tolist()],
             "thresholds": [float(value) for value in pr_thresholds.tolist()],
         },
+    }
+
+
+def compute_subset_macro_metrics(
+    labels: Sequence[int],
+    scores: Sequence[float],
+    subsets: Sequence[str | None],
+) -> Dict[str, Any]:
+    grouped: Dict[str, Dict[str, List[float] | List[int]]] = {}
+    for label, score, subset in zip(labels, scores, subsets):
+        if subset is None or not str(subset).strip():
+            continue
+        key = str(subset)
+        bucket = grouped.setdefault(key, {"labels": [], "scores": []})
+        bucket["labels"].append(int(label))  # type: ignore[union-attr]
+        bucket["scores"].append(float(score))  # type: ignore[union-attr]
+
+    per_subset: Dict[str, Dict[str, Any]] = {}
+    aurocs: List[float] = []
+    auprs: List[float] = []
+    for subset, bucket in sorted(grouped.items()):
+        subset_labels = [int(value) for value in bucket["labels"]]  # type: ignore[index]
+        subset_scores = [float(value) for value in bucket["scores"]]  # type: ignore[index]
+        positives = int(sum(subset_labels))
+        negatives = int(len(subset_labels) - positives)
+        if positives == 0 or negatives == 0:
+            continue
+        auroc = float(roc_auc_score(subset_labels, subset_scores))
+        aupr = float(average_precision_score(subset_labels, subset_scores))
+        per_subset[subset] = {
+            "count": int(len(subset_labels)),
+            "positives": positives,
+            "negatives": negatives,
+            "auroc": auroc,
+            "aupr": aupr,
+        }
+        aurocs.append(auroc)
+        auprs.append(aupr)
+
+    if not per_subset:
+        return {}
+    return {
+        "macro_auroc": float(sum(aurocs) / len(aurocs)),
+        "macro_aupr": float(sum(auprs) / len(auprs)),
+        "subset_count": int(len(per_subset)),
+        "subsets": per_subset,
     }
 
 
@@ -491,6 +894,32 @@ def train_dgst_probe(
     if best_metrics is None:
         raise RuntimeError("DGST probe training finished without validation metrics.")
 
+    amber_subset_macro = compute_subset_macro_metrics(
+        [int(sample.hallucinated) for sample in val_samples],
+        [float(value) for value in best_metrics["hallucination_probabilities"]],
+        [
+            str(sample.metadata.get("amber_discriminative_type"))
+            if sample.metadata.get("amber_discriminative_type") is not None
+            else None
+            for sample in val_samples
+        ],
+    )
+    if amber_subset_macro:
+        best_metrics["amber_subset_macro"] = amber_subset_macro
+
+    pope_subset_macro = compute_subset_macro_metrics(
+        [int(sample.hallucinated) for sample in val_samples],
+        [float(value) for value in best_metrics["hallucination_probabilities"]],
+        [
+            str(sample.metadata.get("pope_subset"))
+            if sample.metadata.get("pope_subset") is not None
+            else None
+            for sample in val_samples
+        ],
+    )
+    if pope_subset_macro:
+        best_metrics["pope_subset_macro"] = pope_subset_macro
+
     (output_dir / "history.json").write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "config.json").write_text(json.dumps(asdict(config), ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -505,22 +934,23 @@ def train_dgst_probe(
 
 def build_dgst_val_prediction_rows(
     val_samples: Sequence[DGSTProbeSample],
-    non_hallucination_probabilities: Sequence[float],
+    hallucination_probabilities: Sequence[float],
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for sample, probability in zip(val_samples, non_hallucination_probabilities):
-        rows.append(
-            {
-                "sample_id": sample.sample_id,
-                "image_id": int(sample.image_id),
-                "canonical_name": sample.canonical_name,
-                "surface": sample.surface,
-                "phrase": sample.phrase,
-                "hallucinated": int(sample.hallucinated),
-                "non_hallucination_label": int(1 - sample.hallucinated),
-                "non_hallucination_probability": float(probability),
-                "hallucination_probability": float(1.0 - probability),
-                "dgst_final_score": float(sample.dgst_final_score),
-            }
-        )
+    for sample, probability in zip(val_samples, hallucination_probabilities):
+        row = {
+            "sample_id": sample.sample_id,
+            "image_id": int(sample.image_id),
+            "split_group_id": _split_group_id(sample),
+            "canonical_name": sample.canonical_name,
+            "surface": sample.surface,
+            "phrase": sample.phrase,
+            "hallucinated": int(sample.hallucinated),
+            "hallucination_label": int(sample.hallucinated),
+            "hallucination_probability": float(probability),
+            "non_hallucination_probability": float(1.0 - probability),
+            "dgst_final_score": float(sample.dgst_final_score),
+        }
+        row.update(sample.metadata)
+        rows.append(row)
     return rows

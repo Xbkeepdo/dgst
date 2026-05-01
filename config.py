@@ -23,8 +23,18 @@ class ProjectPaths:
     experiment_log_file: Path = PROJECT_ROOT / "experiment_log.jsonl"
     coco_ground_truth_file: Path = PROJECT_ROOT / "coco_ground_truth.json"
     objects365_ground_truth_file: Path = PROJECT_ROOT / "objects365_ground_truth.jsonl"
+    amber_ground_truth_file: Path = PROJECT_ROOT / "amber_ground_truth.jsonl"
+    amber_discriminative_ground_truth_file: Path = PROJECT_ROOT / "amber_discriminative_ground_truth.jsonl"
+    amber_discriminative_paired_ground_truth_file: Path = PROJECT_ROOT / "amber_discriminative_paired_ground_truth.jsonl"
+    pope_paired_ground_truth_file: Path = PROJECT_ROOT / "pope_paired_ground_truth.jsonl"
+    mhaldetect_ground_truth_file: Path = PROJECT_ROOT / "mhaldetect_ground_truth.jsonl"
     chair_cache_file: Path = PROJECT_ROOT / "chair.pkl"
     objects365_cache_file: Path = PROJECT_ROOT / "objects365_v2_val.cache.json"
+    amber_cache_file: Path = PROJECT_ROOT / "amber_generative.cache.json"
+    amber_discriminative_cache_file: Path = PROJECT_ROOT / "amber_discriminative.cache.json"
+    amber_discriminative_paired_cache_file: Path = PROJECT_ROOT / "amber_discriminative_paired.cache.json"
+    pope_paired_cache_file: Path = PROJECT_ROOT / "pope_paired.cache.json"
+    mhaldetect_cache_file: Path = PROJECT_ROOT / "mhaldetect_val.cache.json"
     evaluation_file: Path = PROJECT_ROOT / "evaluation_results.json"
     single_output_file: Path = PROJECT_ROOT / "outputs" / "dgst_result.json"
 
@@ -77,6 +87,7 @@ class DGSTConfig:
     risk_start_layer: int = 15
     alpha: float = 2.0
     ot_solver: str = "linprog"
+    target_aggregation: str = "mean"
 
 
 @dataclass(frozen=True)
@@ -92,6 +103,7 @@ class DGSTEvalConfig:
     evaluation_file: Path | None = None
     plot_dir: Path | None = None
     image_ids_file: Path | None = None
+    sentence_last_generation_time: bool = False
     category_top_k: int = 5
     category_min_count: int = 8
 
@@ -108,6 +120,7 @@ class DGSTExportConfig:
     output_file: Path | None = None
     manifest_file: Path | None = None
     work_dir: Path | None = None
+    sentence_last_generation_time: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,6 +135,7 @@ class ProbeTrainConfig:
     lr_factor: float = 0.5
     lr_patience: int = 5
     test_size: float = 0.2
+    split_by: str = "group"
     seed: int = 0
     split_file: Path | None = None
     num_runs: int = 1
@@ -149,6 +163,18 @@ def normalize_dataset_name(dataset: str) -> str:
     normalized = str(dataset).strip().lower()
     if normalized == "mscoco":
         return "coco"
+    if normalized in {"amber-yn", "amber_yesno", "amber-discriminative", "amber_discriminative"}:
+        return "amber_discriminative"
+    if normalized in {
+        "amber-yn-paired",
+        "amber_yesno_paired",
+        "amber-discriminative-paired",
+        "amber_discriminative_paired",
+        "amber_paired",
+    }:
+        return "amber_discriminative_paired"
+    if normalized in {"pope", "pope_paired", "pope-paired", "pope_yesno", "pope-yn"}:
+        return "pope_paired"
     return normalized
 
 
@@ -171,6 +197,36 @@ def default_dataset_registry(paths: ProjectPaths | None = None) -> dict[str, dic
             "adapter_cache": paths.objects365_cache_file,
             "ground_truth_file": paths.objects365_ground_truth_file,
             "lexicon_file": PROJECT_ROOT / "resources" / "objects365_aliases.json",
+        },
+        "amber": {
+            "dataset_root": userdata / "AMBER" / "images",
+            "annotation_path": userdata / "AMBER" / "data",
+            "adapter_cache": paths.amber_cache_file,
+            "ground_truth_file": paths.amber_ground_truth_file,
+        },
+        "amber_discriminative": {
+            "dataset_root": userdata / "AMBER" / "images",
+            "annotation_path": userdata / "AMBER" / "data",
+            "adapter_cache": paths.amber_discriminative_cache_file,
+            "ground_truth_file": paths.amber_discriminative_ground_truth_file,
+        },
+        "amber_discriminative_paired": {
+            "dataset_root": userdata / "AMBER" / "images",
+            "annotation_path": userdata / "AMBER" / "data",
+            "adapter_cache": paths.amber_discriminative_paired_cache_file,
+            "ground_truth_file": paths.amber_discriminative_paired_ground_truth_file,
+        },
+        "pope_paired": {
+            "dataset_root": userdata / "val2014",
+            "annotation_path": userdata / "dgst-experienment" / "POPE" / "output" / "coco",
+            "adapter_cache": paths.pope_paired_cache_file,
+            "ground_truth_file": paths.pope_paired_ground_truth_file,
+        },
+        "mhaldetect": {
+            "dataset_root": userdata / "val2014",
+            "annotation_path": userdata / "M-HalDetect",
+            "adapter_cache": paths.mhaldetect_cache_file,
+            "ground_truth_file": paths.mhaldetect_ground_truth_file,
         },
     }
 
@@ -266,6 +322,7 @@ def apply_paper_probe_defaults(config: ProbeTrainConfig) -> ProbeTrainConfig:
         lr_factor=0.5,
         lr_patience=5,
         test_size=config.test_size,
+        split_by=config.split_by,
         seed=config.seed,
         split_file=config.split_file,
         num_runs=config.num_runs,

@@ -199,7 +199,7 @@ def _align_entries_to_targets(
                     clean_up_tokenization_spaces=False,
                 ).strip()
                 matched_target = TargetSpan(
-                    kind=str(entry.get("kind", "object")),
+                    kind=str(entry.get("kind") or "object"),
                     surface=token_text or str(entry.get("surface") or phrase),
                     phrase=str(entry.get("phrase") or entry.get("surface") or phrase),
                     answer_token_start=match_start,
@@ -289,7 +289,7 @@ def build_object_targets_from_mentions(
             continue
         entries.append(
             {
-                "kind": "object",
+                "kind": str(mention.get("kind") or "object"),
                 "phrase": phrase,
                 "surface": mention.get("surface"),
                 "surface_word": mention.get("surface_word") or mention.get("surface"),
@@ -306,6 +306,146 @@ def build_object_targets_from_mentions(
         answer_token_positions=answer_token_positions,
         entries=entries,
     )
+
+
+def _sentence_variants(text: str) -> List[str]:
+    stripped = str(text).strip()
+    if not stripped:
+        return []
+    variants = [stripped, f" {stripped}", f"\n{stripped}", f"\n\n{stripped}", f" \n\n{stripped}"]
+    no_trailing_punct = stripped.rstrip(" \t\r\n.!?")
+    if no_trailing_punct and no_trailing_punct != stripped:
+        variants.extend(
+            [
+                no_trailing_punct,
+                f" {no_trailing_punct}",
+                f"\n{no_trailing_punct}",
+                f"\n\n{no_trailing_punct}",
+                f" \n\n{no_trailing_punct}",
+            ]
+        )
+    return list(dict.fromkeys(variants))
+
+
+def _encode_sentence_variant(tokenizer: Any, text: str) -> List[int]:
+    return [int(token_id) for token_id in tokenizer.encode(str(text), add_special_tokens=False)]
+
+
+def _choose_sentence_match(matches: Sequence[int], width: int, preferred_start: int) -> int | None:
+    candidates = [int(start) for start in matches if int(start) + int(width) > int(preferred_start)]
+    if not candidates:
+        candidates = [int(start) for start in matches]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda start: (abs(start - int(preferred_start)), start))
+
+
+def build_sentence_last_token_targets(
+    tokenizer: Any,
+    answer_token_ids: Sequence[int],
+    answer_token_positions: Sequence[int],
+    sentence_mentions: Sequence[Dict[str, Any]],
+    answer_text: str | None = None,
+) -> tuple[List[TargetSpan], List[Dict[str, Any]]]:
+    targets: List[TargetSpan] = []
+    alignment_rows: List[Dict[str, Any]] = []
+    preferred_start = 0
+
+    for sentence_index, entry in enumerate(sentence_mentions):
+        sentence_text = str(entry.get("sentence_text") or entry.get("phrase") or entry.get("surface") or "").strip()
+        matched_target: TargetSpan | None = None
+        matched_strategy: str | None = None
+        for variant_index, phrase in enumerate(_sentence_variants(sentence_text)):
+            strategy = "sentence_exact" if variant_index < 2 else "sentence_no_trailing_punct"
+            token_pattern = _encode_sentence_variant(tokenizer, phrase)
+            if not token_pattern:
+                continue
+            match_start = _choose_sentence_match(
+                _find_subsequence(answer_token_ids, token_pattern),
+                width=len(token_pattern),
+                preferred_start=preferred_start,
+            )
+            if match_start is None:
+                continue
+            match_end = match_start + len(token_pattern)
+            last_index = match_end - 1
+            token_text = tokenizer.decode(
+                [int(answer_token_ids[last_index])],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+            matched_target = TargetSpan(
+                kind="sentence",
+                surface=token_text or sentence_text,
+                phrase=sentence_text,
+                answer_token_start=last_index,
+                answer_token_end=last_index + 1,
+                merged_token_positions=[int(answer_token_positions[last_index])],
+                canonical_name="sentence",
+                mention_index=int(entry.get("sentence_index", entry.get("mention_index", sentence_index))),
+                word_index=entry.get("word_index"),
+                hallucinated=int(entry.get("hallucinated", 0)),
+                alignment_strategy=strategy,
+                source_surface=sentence_text,
+            )
+            matched_strategy = strategy
+            preferred_start = match_end
+            break
+
+        if matched_target is None and answer_text is not None and entry.get("sentence_char_end") is not None:
+            char_end = int(entry["sentence_char_end"])
+            prefix_text = str(answer_text)[:char_end]
+            prefix_candidates = [
+                _encode_sentence_variant(tokenizer, prefix_text),
+                _encode_sentence_variant(tokenizer, f" {prefix_text}"),
+            ]
+            for prefix_ids in prefix_candidates:
+                if not prefix_ids:
+                    continue
+                if list(answer_token_ids[: len(prefix_ids)]) == prefix_ids:
+                    last_index = len(prefix_ids) - 1
+                elif len(prefix_ids) > 1 and list(answer_token_ids[: len(prefix_ids) - 1]) == prefix_ids[1:]:
+                    last_index = len(prefix_ids) - 2
+                else:
+                    last_index = min(max(len(prefix_ids) - 1, 0), len(answer_token_ids) - 1)
+                if last_index < 0 or last_index >= len(answer_token_ids):
+                    continue
+                token_text = tokenizer.decode(
+                    [int(answer_token_ids[last_index])],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                ).strip()
+                matched_target = TargetSpan(
+                    kind="sentence",
+                    surface=token_text or sentence_text,
+                    phrase=sentence_text,
+                    answer_token_start=last_index,
+                    answer_token_end=last_index + 1,
+                    merged_token_positions=[int(answer_token_positions[last_index])],
+                    canonical_name="sentence",
+                    mention_index=int(entry.get("sentence_index", entry.get("mention_index", sentence_index))),
+                    word_index=entry.get("word_index"),
+                    hallucinated=int(entry.get("hallucinated", 0)),
+                    alignment_strategy="sentence_prefix_length",
+                    source_surface=sentence_text,
+                )
+                matched_strategy = "sentence_prefix_length"
+                preferred_start = last_index + 1
+                break
+
+        alignment_rows.append(
+            _alignment_record(
+                entry=entry,
+                status="aligned" if matched_target is not None else "unaligned",
+                strategy=matched_strategy,
+                target=matched_target,
+            )
+        )
+        if matched_target is not None:
+            targets.append(matched_target)
+
+    targets.sort(key=lambda item: item.answer_token_start)
+    return targets, alignment_rows
 
 
 def summarize_targets(

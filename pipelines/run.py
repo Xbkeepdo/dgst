@@ -101,6 +101,7 @@ def _compose_dgst_summary(
             "risk_start_layer": cfg.risk_start_layer,
             "alpha": cfg.alpha,
             "ot_solver": cfg.ot_solver,
+            "target_aggregation": cfg.target_aggregation,
         },
         "plot_files": {
             "plot_dir": str(eval_config.plot_dir) if eval_config.plot_dir is not None else None,
@@ -173,6 +174,7 @@ def run_dgst_single_analysis(
             risk_start_layer=dgst_config.risk_start_layer,
             alpha=dgst_config.alpha,
             ot_solver=dgst_config.ot_solver,
+            target_aggregation=dgst_config.target_aggregation,
         )
     else:
         result = analyzer.analyze(
@@ -189,6 +191,7 @@ def run_dgst_single_analysis(
             risk_start_layer=dgst_config.risk_start_layer,
             alpha=dgst_config.alpha,
             ot_solver=dgst_config.ot_solver,
+            target_aggregation=dgst_config.target_aggregation,
         )
     analyzer.save_json(result, output_path)
     print(f"Saved DGST single-image result to: {Path(output_path).resolve()}")
@@ -241,32 +244,50 @@ def _run_dgst_evaluation_single(eval_config: DGSTEvalConfig) -> dict[str, Any]:
         if not image_path.exists():
             print(f"Skip missing image: {image_path}")
             continue
+        question = (
+            adapter.question_for_image_id(image_id)
+            if hasattr(adapter, "question_for_image_id")
+            else cfg.prompt
+        )
+        caption_from_dataset = (
+            adapter.caption_for_image_id(image_id)
+            if hasattr(adapter, "caption_for_image_id")
+            else None
+        )
 
         if image_id in result_data:
             row = result_data[image_id]
-            cached_records = collect_dgst_object_records(row)
-            object_records.extend(cached_records)
-            processed_images += 1
-            total_mentions += int(row.get("chair_word_count_total", len(row.get("object_mentions", []))))
-            aligned_mentions += len(cached_records)
-            dropped_unaligned_mentions += int(
-                row.get(
-                    "dropped_unaligned_count",
-                    max(0, int(row.get("chair_word_count_total", len(row.get("object_mentions", [])))) - len(cached_records)),
-                )
+            cached_aggregation = str(
+                row.get("target_aggregation")
+                or row.get("dgst_config", {}).get("target_aggregation")
+                or "mean"
             )
-            total_gt_categories += int(row.get("gt_category_count", 0))
-            total_evaluated_gt_categories += int(row.get("evaluated_gt_category_count", row.get("gt_category_count", 0)))
-            progress.set_postfix(image_id=image_id, cached="result", aligned=len(cached_records))
-            continue
+            if cached_aggregation == str(cfg.target_aggregation):
+                cached_records = collect_dgst_object_records(row)
+                object_records.extend(cached_records)
+                processed_images += 1
+                total_mentions += int(row.get("chair_word_count_total", len(row.get("object_mentions", []))))
+                aligned_mentions += len(cached_records)
+                dropped_unaligned_mentions += int(
+                    row.get(
+                        "dropped_unaligned_count",
+                        max(0, int(row.get("chair_word_count_total", len(row.get("object_mentions", [])))) - len(cached_records)),
+                    )
+                )
+                total_gt_categories += int(row.get("gt_category_count", 0))
+                total_evaluated_gt_categories += int(row.get("evaluated_gt_category_count", row.get("gt_category_count", 0)))
+                progress.set_postfix(image_id=image_id, cached="result", aligned=len(cached_records))
+                continue
 
         cached_caption = caption_data.get(image_id)
-        if cached_caption is not None and eval_config.reuse_captions:
+        if caption_from_dataset is not None:
+            caption = str(caption_from_dataset)
+        elif cached_caption is not None and eval_config.reuse_captions:
             caption = str(cached_caption["caption"])
         else:
             caption = analyzer.generate_answer(
                 image_path=image_path,
-                question=cfg.prompt,
+                question=question,
                 max_new_tokens=cfg.max_new_tokens,
                 do_sample=cfg.inference_temp > 0.0,
                 temperature=cfg.inference_temp,
@@ -276,7 +297,7 @@ def _run_dgst_evaluation_single(eval_config: DGSTEvalConfig) -> dict[str, Any]:
                 cached_caption = {
                     "image_id": image_id,
                     "image_path": str(image_path),
-                    "prompt": cfg.prompt,
+                    "prompt": question,
                     "caption": caption,
                 }
                 append_jsonl(eval_config.caption_file, cached_caption)
@@ -285,7 +306,7 @@ def _run_dgst_evaluation_single(eval_config: DGSTEvalConfig) -> dict[str, Any]:
         adapter_eval = adapter.evaluate_caption(image_id, caption, protocol=spec.protocol)
         result = analyzer.analyze(
             image_path=image_path,
-            question=cfg.prompt,
+            question=question,
             answer=caption,
             target_mode="objects",
             object_mentions=adapter_eval["object_mentions"],
@@ -297,6 +318,7 @@ def _run_dgst_evaluation_single(eval_config: DGSTEvalConfig) -> dict[str, Any]:
             risk_start_layer=cfg.risk_start_layer,
             alpha=cfg.alpha,
             ot_solver=cfg.ot_solver,
+            target_aggregation=cfg.target_aggregation,
         )
 
         gt_objects = set(adapter_eval["ground_truth_objects"])
@@ -326,7 +348,7 @@ def _run_dgst_evaluation_single(eval_config: DGSTEvalConfig) -> dict[str, Any]:
             "lexicon_version": metadata["lexicon_version"],
             "mention_linker_backend": metadata["mention_linker_backend"],
             "taxonomy_backend": metadata["taxonomy_backend"],
-            "prompt": cfg.prompt,
+            "prompt": question,
             "caption": caption,
             "chair_s": adapter_eval["chair_s"],
             "chair_i": adapter_eval["chair_i"],
@@ -346,8 +368,18 @@ def _run_dgst_evaluation_single(eval_config: DGSTEvalConfig) -> dict[str, Any]:
             if int(adapter_eval["chair_word_count_total"])
             else 0.0,
             "dgst_final_score_mean": result.get("dgst_final_score_mean"),
+            "target_aggregation": cfg.target_aggregation,
             "dgst_config": result.get("dgst_config"),
         }
+        row.update(
+            {
+                key: value
+                for key, value in adapter_eval.items()
+                if str(key).startswith(("amber_", "mhaldetect_", "pope_"))
+            }
+        )
+        if "split_group_id" in adapter_eval:
+            row["split_group_id"] = int(adapter_eval["split_group_id"])
         row_records = collect_dgst_object_records(row)
         object_records.extend(row_records)
         processed_images += 1
@@ -456,6 +488,8 @@ def _build_dgst_eval_subprocess_command(eval_config: DGSTEvalConfig) -> list[str
         str(cfg.alpha),
         "--ot-solver",
         cfg.ot_solver,
+        "--target-aggregation",
+        cfg.target_aggregation,
         "--gpus",
         ",".join(eval_config.gpus),
         "--category-top-k",

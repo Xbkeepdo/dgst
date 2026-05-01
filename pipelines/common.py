@@ -181,19 +181,24 @@ def load_sampled_image_ids(eval_config: DGSTEvalConfig) -> tuple[list[int], Any]
         cache_path=spec.adapter_cache,
         lexicon_path=spec.lexicon_file,
     )
+    def expand_ids(values: Sequence[int]) -> list[int]:
+        if hasattr(adapter, "expand_sampled_image_ids"):
+            return [int(value) for value in adapter.expand_sampled_image_ids(values)]
+        return [int(value) for value in values]
+
     if eval_config.image_ids_file is not None:
         image_ids = adapter.list_image_ids(
             split=spec.split,
             max_samples=eval_config.num_data,
             image_ids_file=eval_config.image_ids_file,
         )
-        return image_ids, adapter
+        return expand_ids(image_ids), adapter
 
     image_ids = adapter.list_image_ids(split=spec.split)
     if eval_config.num_data is None or eval_config.num_data <= 0 or eval_config.num_data >= len(image_ids):
-        return image_ids, adapter
+        return expand_ids(image_ids), adapter
     rng = random.Random(eval_config.seed)
-    return rng.sample(image_ids, eval_config.num_data), adapter
+    return expand_ids(rng.sample(image_ids, eval_config.num_data)), adapter
 
 
 def load_ground_truth_entries(adapter: Any, eval_config: DGSTEvalConfig) -> list[dict[str, Any]]:

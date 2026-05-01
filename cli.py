@@ -19,7 +19,7 @@ from .config import (
     project_paths,
     resolve_dataset_spec,
 )
-from .probe import PROBE_FEATURE_SET_CHOICES
+from .probe import PROBE_FEATURE_SET_CHOICES, PROBE_SPLIT_BY_CHOICES
 
 
 def _default_eval_run_name(*, prefix: str, dataset: str, protocol: str, num_data: int, seed: int) -> str:
@@ -110,6 +110,11 @@ def _add_dgst_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--risk-start-layer", type=int, default=defaults.risk_start_layer)
     parser.add_argument("--alpha", type=float, default=defaults.alpha)
     parser.add_argument("--ot-solver", default=defaults.ot_solver)
+    parser.add_argument(
+        "--target-aggregation",
+        choices=["mean", "last", "max"],
+        default=defaults.target_aggregation,
+    )
 
 
 def _build_dgst_config(args: argparse.Namespace) -> DGSTConfig:
@@ -132,6 +137,7 @@ def _build_dgst_config(args: argparse.Namespace) -> DGSTConfig:
         risk_start_layer=args.risk_start_layer,
         alpha=args.alpha,
         ot_solver=args.ot_solver,
+        target_aggregation=args.target_aggregation,
     )
 
 
@@ -191,6 +197,33 @@ def build_parser() -> argparse.ArgumentParser:
     export_probe.add_argument("--work-dir", default=None)
     export_probe.add_argument("--no-reuse-captions", action="store_true")
 
+    export_sentence_last = subparsers.add_parser("export-sentence-last-probe")
+    _add_dataset_args(export_sentence_last)
+    _add_dgst_args(export_sentence_last)
+    export_sentence_last.add_argument("--num-data", type=int, default=None)
+    export_sentence_last.add_argument("--seed", type=int, default=0)
+    export_sentence_last.add_argument("--gpus", default="0,1")
+    export_sentence_last.add_argument("--run-name", default=None)
+    export_sentence_last.add_argument("--caption-file", default=None)
+    export_sentence_last.add_argument("--output-file", default=None)
+    export_sentence_last.add_argument("--manifest-file", default=None)
+    export_sentence_last.add_argument("--work-dir", default=None)
+    export_sentence_last.add_argument("--no-reuse-captions", action="store_true")
+    export_sentence_last.add_argument("--generation-time", action="store_true")
+
+    sentence_last_worker = subparsers.add_parser("sentence-last-worker")
+    _add_dataset_args(sentence_last_worker)
+    _add_dgst_args(sentence_last_worker)
+    sentence_last_worker.add_argument("--num-data", type=int, default=None)
+    sentence_last_worker.add_argument("--seed", type=int, default=0)
+    sentence_last_worker.add_argument("--gpus", default="0")
+    sentence_last_worker.add_argument("--caption-file", default=None)
+    sentence_last_worker.add_argument("--result-file", default=None)
+    sentence_last_worker.add_argument("--evaluation-file", default=None)
+    sentence_last_worker.add_argument("--image-ids-file", default=None)
+    sentence_last_worker.add_argument("--no-reuse-captions", action="store_true")
+    sentence_last_worker.add_argument("--generation-time", action="store_true")
+
     train_probe = subparsers.add_parser("train-probe")
     train_probe.add_argument("--dataset-file", default=None)
     train_probe.add_argument("--run-name", default=None)
@@ -203,6 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_probe.add_argument("--lr-factor", type=float, default=0.5)
     train_probe.add_argument("--lr-patience", type=int, default=5)
     train_probe.add_argument("--test-size", type=float, default=0.2)
+    train_probe.add_argument("--split-by", choices=PROBE_SPLIT_BY_CHOICES, default="group")
     train_probe.add_argument("--seed", type=int, default=0)
     train_probe.add_argument("--split-file", default=None)
     train_probe.add_argument("--num-runs", type=int, default=1)
@@ -218,6 +252,13 @@ def build_parser() -> argparse.ArgumentParser:
     eval_probe.add_argument("--run-name", default=None)
     eval_probe.add_argument("--output-dir", default=None)
     eval_probe.add_argument("--device", default=None)
+
+    sentence_probe = subparsers.add_parser("build-sentence-probe")
+    sentence_probe.add_argument("--input-file", required=True)
+    sentence_probe.add_argument("--run-name", default=None)
+    sentence_probe.add_argument("--output-file", default=None)
+    sentence_probe.add_argument("--manifest-file", default=None)
+    sentence_probe.add_argument("--feature-aggregation", choices=["mean", "max"], default="mean")
 
     build_cache = subparsers.add_parser("build-cache")
     _add_dataset_args(build_cache)
@@ -293,6 +334,53 @@ def main() -> None:
         print(json.dumps(manifest, ensure_ascii=False, indent=2))
         return
 
+    if args.command == "export-sentence-last-probe":
+        from .pipelines.probe_tasks import export_dgst_sentence_last_probe_dataset
+
+        dataset_spec = _build_dataset_spec(args)
+        default_run_name = f"{default_export_run_name(dataset_spec.dataset, dataset_spec.protocol, args.num_data)}_sentence_last"
+        export_config = DGSTExportConfig(
+            dataset_spec=dataset_spec,
+            dgst_config=_build_dgst_config(args),
+            num_data=args.num_data,
+            seed=args.seed,
+            gpus=parse_gpus(args.gpus),
+            reuse_captions=not args.no_reuse_captions,
+            run_name=args.run_name or default_run_name,
+            output_file=Path(args.output_file) if args.output_file else None,
+            manifest_file=Path(args.manifest_file) if args.manifest_file else None,
+            work_dir=Path(args.work_dir) if args.work_dir else None,
+            sentence_last_generation_time=bool(args.generation_time),
+        )
+        manifest = export_dgst_sentence_last_probe_dataset(
+            export_config,
+            caption_file=Path(args.caption_file) if args.caption_file else None,
+        )
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "sentence-last-worker":
+        from .pipelines.probe_tasks import run_dgst_sentence_last_worker
+
+        summary = run_dgst_sentence_last_worker(
+            DGSTEvalConfig(
+                dataset_spec=_build_dataset_spec(args),
+                dgst_config=_build_dgst_config(args),
+                num_data=args.num_data,
+                seed=args.seed,
+                gpus=parse_gpus(args.gpus),
+                reuse_captions=not args.no_reuse_captions,
+                caption_file=Path(args.caption_file) if args.caption_file else None,
+                result_file=Path(args.result_file) if args.result_file else None,
+                evaluation_file=Path(args.evaluation_file) if args.evaluation_file else None,
+                plot_dir=None,
+                image_ids_file=Path(args.image_ids_file) if args.image_ids_file else None,
+                sentence_last_generation_time=bool(args.generation_time),
+            )
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return
+
     if args.command == "train-probe":
         from .pipelines.probe_tasks import train_dgst_probe_run
 
@@ -314,6 +402,7 @@ def main() -> None:
                 lr_factor=args.lr_factor,
                 lr_patience=args.lr_patience,
                 test_size=args.test_size,
+                split_by=args.split_by,
                 seed=args.seed,
                 split_file=Path(args.split_file) if args.split_file else None,
                 num_runs=args.num_runs,
@@ -340,6 +429,22 @@ def main() -> None:
             )
         )
         print(json.dumps(metrics, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "build-sentence-probe":
+        from .pipelines.probe_tasks import build_sentence_level_dgst_probe_dataset
+
+        run_name = args.run_name or "sentence_probe"
+        base_dir = paths.probe_data_dir / run_name
+        output_file = Path(args.output_file) if args.output_file else base_dir / "probe_dataset.jsonl"
+        manifest_file = Path(args.manifest_file) if args.manifest_file else base_dir / "probe_dataset_manifest.json"
+        manifest = build_sentence_level_dgst_probe_dataset(
+            input_file=Path(args.input_file),
+            output_file=output_file,
+            manifest_file=manifest_file,
+            feature_aggregation=args.feature_aggregation,
+        )
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
         return
 
     if args.command == "build-cache":
